@@ -1,0 +1,90 @@
+# Asset Classifier — lat/lon → aerial chip → Gemini classification
+
+Takes a CSV of coordinates, pulls the newest public-domain NAIP aerial image
+chip for each point, and asks Gemini to classify the central asset as
+tower / rooftop / other. Outputs `results.csv` plus the saved chips for review.
+
+## Project files
+
+```
+asset_classifier.py   # the pipeline
+requirements.txt      # python dependencies
+assets.csv            # your input — replace the sample rows with real coordinates
+```
+
+## Setup (one time)
+
+1. Put these three files in a folder and open that folder in Cursor.
+
+2. Create a virtual environment and install dependencies. In Cursor's
+   terminal (Terminal → New Terminal):
+
+   ```bash
+   python -m venv .venv
+   # macOS / Linux:
+   source .venv/bin/activate
+   # Windows (PowerShell):
+   .venv\Scripts\Activate.ps1
+
+   pip install -r requirements.txt
+   ```
+
+3. Set your Gemini API key (create one free at https://aistudio.google.com/apikey —
+   a Google account is enough, no credit card needed):
+
+   ```bash
+   # macOS / Linux:
+   export GEMINI_API_KEY=AIza-your-key-here
+   # Windows (PowerShell):
+   $env:GEMINI_API_KEY="AIza-your-key-here"
+   ```
+
+   Note: the free tier allows ~10 requests/minute and a few hundred per day —
+   plenty for testing. The script paces itself to stay under the limit.
+
+4. (Optional) Nearmap oblique imagery. If you have a Nearmap subscription with
+   the Transactional Content API and Panorama content, set:
+
+   ```bash
+   # Windows (PowerShell):
+   $env:NEARMAP_API_KEY="your-nearmap-key"
+   ```
+
+   Each asset then also gets a ~7 cm top-down view plus 45° oblique panoramas
+   from four compass directions, which make towers and rooftop antennas far
+   easier to detect than top-down imagery alone. Note: each asset consumes
+   Nearmap transactional credits (scales with `NEARMAP_CHIP_M` area). Without
+   the key the pipeline runs NAIP-only, as before.
+
+## Run
+
+1. Edit `assets.csv` — keep the header row, one asset per line:
+
+   ```
+   id,lat,lon
+   site_0001,40.689247,-74.044502
+   ```
+
+   (lat/lon in decimal degrees, WGS84 — the format Google Maps shows.)
+
+2. ```bash
+   python asset_classifier.py
+   ```
+
+3. Results land in `results.csv` (classification, confidence, evidence,
+   image date) and the cropped images in `chips/` so you can spot-check
+   Claude's calls.
+
+## Notes & knobs
+
+- `CHIP_SIZE_M` (default 250) — shrink to ~150 for tighter zoom if towers
+  are being missed; grow for more context.
+- `MODEL` — `gemini-2.5-flash` is free-tier friendly with solid vision quality;
+  swap in a stronger Gemini model later if classifications need a boost.
+- NAIP covers the continental US only. For higher-fidelity state imagery
+  (NY 6-inch, CT 3-inch, NJ 1-foot), the fetch stage can be swapped for an
+  ArcGIS ImageServer or S3 adapter — the classification stage stays the same.
+- First run on a new machine: `rasterio` wheels occasionally need a recent
+  pip (`pip install --upgrade pip`) before installing.
+- At thousands of assets, move off the free tier (link billing) and use the
+  Gemini Batch API for ~50% cost savings.
