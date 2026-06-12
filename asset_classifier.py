@@ -1,9 +1,12 @@
 """
-Asset classifier pipeline: lat/lon -> NAIP aerial chip -> Gemini vision classification.
+Asset classifier pipeline: coordinates or street address -> NAIP aerial chip
+-> Gemini vision classification.
 
 Flow:
-  1. Read coordinates from assets.csv (columns: id, lat, lon; optional label,
-     input_confidence: high | medium | low for source trust)
+  1. Read sites from assets.csv (columns: id; plus lat+lon OR address; optional
+     label, input_confidence: high | medium | low for source trust). Addresses
+     are geocoded to lat/lon via the free US Census Geocoder (CONUS) with
+     OpenStreetMap Nominatim as fallback.
   2. Query Microsoft Planetary Computer STAC API for the newest NAIP scene at each point
   3. Windowed-read a chip around the point from the Cloud-Optimized GeoTIFF (no full download)
   4. Optional: if NEARMAP_API_KEY is set, also pull a high-res Nearmap vertical
@@ -32,6 +35,7 @@ import json
 import math
 import os
 import time
+import argparse
 from pathlib import Path
 
 import numpy as np
@@ -64,10 +68,21 @@ MODELS = [
     "gemini-2.0-flash-lite",
 ]
 _model_idx = 0
-INPUT_CSV = "assets.csv"    # columns: id, lat, lon; optional: label, input_confidence
+INPUT_CSV = "assets.csv"    # columns: id; lat+lon OR address; optional: label, input_confidence
 INPUT_CONFIDENCE_LEVELS = ("high", "medium", "low")
 OUTPUT_CSV = "results.csv"
 CHIP_DIR = Path("chips")
+
+# Geocoding: free US Census API first (good for CONUS rooftop addresses), then
+# OpenStreetMap Nominatim. Set GEOCODER=nominatim to skip Census.
+GEOCODER = os.environ.get("GEOCODER", "auto").strip().lower()  # auto | census | nominatim
+GEOCODER_USER_AGENT = os.environ.get(
+    "GEOCODER_USER_AGENT", "site-classifier/1.0 (cell-site imagery pipeline)")
+CENSUS_GEOCODE_URL = (
+    "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress")
+CENSUS_BENCHMARK = "Public_AR_Current"
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+GEOCODE_DELAY_S = 1.1      # Nominatim usage policy: max 1 request/second
 
 # Optional Nearmap integration (Tile API).
 # When NEARMAP_API_KEY is set, each asset also gets a high-res top-down view
@@ -339,6 +354,152 @@ def maybe_recheck_equipment(client, res: dict, views: list,
             res["site_evidence"] = recheck.get(
                 "site_evidence", res.get("site_evidence"))
     return res
+
+# ----------------------------- geocoding ------------------------------------
+
+_last_geocode_at = 0.0
+
+
+def _has_coordinates(row) -> bool:
+    lat, lon = row.get("lat"), row.get("lon")
+    if lat is None or lon is None:
+        return False
+    if isinstance(lat, float) and pd.isna(lat):
+        return False
+    if isinstance(lon, float) and pd.isna(lon):
+        return False
+    if str(lat).strip() == "" or str(lon).strip() == "":
+        return False
+    return True
+
+
+def _clean_address(row) -> str | None:
+    address = row.get("address")
+    if address is None or (isinstance(address, float) and pd.isna(address)):
+        return None
+    text = str(address).strip()
+    return text or None
+
+
+def _throttle_nominatim():
+    global _last_geocode_at
+    elapsed = time.time() - _last_geocode_at
+    if elapsed < GEOCODE_DELAY_S:
+        time.sleep(GEOCODE_DELAY_S - elapsed)
+    _last_geocode_at = time.time()
+
+
+def geocode_census(address: str) -> dict | None:
+    """US Census Bureau oneline geocoder - free, no API key, CONUS-focused."""
+    resp = requests.get(
+        CENSUS_GEOCODE_URL,
+        params={
+            "address": address,
+            "benchmark": CENSUS_BENCHMARK,
+            "format": "json",
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    matches = resp.json().get("result", {}).get("addressMatches", [])
+    if not matches:
+        return None
+    match = matches[0]
+    coords = match["coordinates"]
+    return {
+        "lat": float(coords["y"]),
+        "lon": float(coords["x"]),
+        "geocode_source": "census",
+        "geocode_matched_address": match.get("matchedAddress"),
+        "geocode_quality": "census_match",
+    }
+
+
+def geocode_nominatim(address: str) -> dict | None:
+    """OpenStreetMap Nominatim - free, worldwide, 1 req/sec usage policy."""
+    _throttle_nominatim()
+    resp = requests.get(
+        NOMINATIM_URL,
+        params={"q": address, "format": "json", "limit": 1},
+        headers={"User-Agent": GEOCODER_USER_AGENT},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    results = resp.json()
+    if not results:
+        return None
+    hit = results[0]
+    return {
+        "lat": float(hit["lat"]),
+        "lon": float(hit["lon"]),
+        "geocode_source": "nominatim",
+        "geocode_matched_address": hit.get("display_name"),
+        "geocode_quality": hit.get("type") or hit.get("class"),
+    }
+
+
+def geocode_address(address: str) -> dict:
+    """Resolve a street address to lat/lon. Raises ValueError if no match."""
+    errors = []
+    if GEOCODER in ("auto", "census"):
+        try:
+            result = geocode_census(address)
+            if result:
+                return result
+            errors.append("census: no match")
+        except Exception as e:
+            errors.append(f"census: {e}")
+
+    if GEOCODER in ("auto", "nominatim"):
+        try:
+            result = geocode_nominatim(address)
+            if result:
+                return result
+            errors.append("nominatim: no match")
+        except Exception as e:
+            errors.append(f"nominatim: {e}")
+
+    raise ValueError(
+        f"could not geocode address ({'; '.join(errors)}): {address}")
+
+
+def resolve_row_coordinates(row) -> tuple[float, float, dict]:
+    """Return (lat, lon, geocode_metadata). metadata is empty when coords given."""
+    if _has_coordinates(row):
+        return float(row["lat"]), float(row["lon"]), {}
+
+    address = _clean_address(row)
+    if not address:
+        raise ValueError(
+            "each row needs lat+lon or a non-empty address column")
+
+    geo = geocode_address(address)
+    meta = {k: v for k, v in geo.items() if k not in ("lat", "lon")}
+    meta["input_address"] = address
+    return geo["lat"], geo["lon"], meta
+
+
+def validate_input_csv(df: pd.DataFrame):
+    """Ensure each row has id and either coordinates or an address."""
+    if "id" not in df.columns:
+        raise SystemExit(f"{INPUT_CSV} is missing required column: id")
+    has_coords = "lat" in df.columns and "lon" in df.columns
+    has_address = "address" in df.columns
+    if not has_coords and not has_address:
+        raise SystemExit(
+            f"{INPUT_CSV} needs lat+lon columns, an address column, or both")
+
+    missing = []
+    for _, row in df.iterrows():
+        if _has_coordinates(row):
+            continue
+        if _clean_address(row):
+            continue
+        missing.append(row["id"])
+    if missing:
+        raise SystemExit(
+            f"{INPUT_CSV}: these rows have no lat/lon and no address: "
+            f"{missing[:5]}{'...' if len(missing) > 5 else ''}")
 
 # ----------------------------- imagery stage --------------------------------
 
@@ -891,6 +1052,27 @@ def write_executive_summary(results: list[dict], assets_df: pd.DataFrame):
 # --------------------------------- pipeline ---------------------------------
 
 def main():
+    global INPUT_CSV, OUTPUT_CSV, EXECUTIVE_SUMMARY_MD
+
+    parser = argparse.ArgumentParser(description="Classify cell sites from aerial imagery")
+    parser.add_argument("--input", "-i", default=INPUT_CSV,
+                        help=f"Input CSV (default: {INPUT_CSV})")
+    parser.add_argument("--output", "-o", default=None,
+                        help="Output CSV (default: results.csv or WI_results.csv pattern)")
+    args = parser.parse_args()
+
+    INPUT_CSV = args.input
+    if args.output:
+        OUTPUT_CSV = args.output
+    elif INPUT_CSV.endswith("_assets.csv"):
+        OUTPUT_CSV = INPUT_CSV.replace("_assets.csv", "_results.csv")
+    else:
+        OUTPUT_CSV = "results.csv"
+    stem = Path(OUTPUT_CSV).stem
+    EXECUTIVE_SUMMARY_MD = f"{stem.replace('_results', '')}_EXECUTIVE_SUMMARY.md"
+    if stem == "results":
+        EXECUTIVE_SUMMARY_MD = "EXECUTIVE_SUMMARY.md"
+
     if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
         raise SystemExit(
             "GEMINI_API_KEY is not set. Get a free key at https://aistudio.google.com/apikey\n"
@@ -900,10 +1082,11 @@ def main():
     client = genai.Client()  # reads GEMINI_API_KEY from environment
     CHIP_DIR.mkdir(exist_ok=True)
 
+    print(f"Input:  {INPUT_CSV}")
+    print(f"Output: {OUTPUT_CSV}")
+
     df = pd.read_csv(INPUT_CSV)
-    missing = {"id", "lat", "lon"} - set(df.columns)
-    if missing:
-        raise SystemExit(f"{INPUT_CSV} is missing required column(s): {sorted(missing)}")
+    validate_input_csv(df)
 
     # Resume support: keep successfully classified rows from a previous run and
     # skip them, so quota is only spent on assets that still need work
@@ -925,15 +1108,22 @@ def main():
     for _, row in df.iterrows():
         if row["id"] in done_ids:
             continue
-        # Carry all input columns (id, lat, lon, label, ...) into the results
+        # Carry all input columns (id, lat, lon, address, label, ...) into results
         record = row.to_dict()
         try:
-            img, img_date, naip_geo = fetch_chip(row["lat"], row["lon"])
+            lat, lon, geocode_meta = resolve_row_coordinates(row)
+            record["lat"] = lat
+            record["lon"] = lon
+            record.update(geocode_meta)
+            if geocode_meta:
+                print(f"  [{row['id']}] geocoded via {geocode_meta.get('geocode_source')}: "
+                      f"{lat:.6f}, {lon:.6f}")
+
+            img, img_date, naip_geo = fetch_chip(lat, lon)
 
             nearmap_views, nearmap_date = {}, None
             try:
-                nearmap_views, nearmap_date = fetch_nearmap_views(
-                    row["lat"], row["lon"])
+                nearmap_views, nearmap_date = fetch_nearmap_views(lat, lon)
             except Exception as e:
                 # Nearmap is an optional enrichment; never let it sink the row
                 print(f"  [{row['id']}] nearmap fetch failed: {e}")
@@ -982,7 +1172,7 @@ def main():
                       f"retrying Nearmap at {NEARMAP_FALLBACK_CHIP_M}m")
                 try:
                     wide_views, wide_date = fetch_nearmap_views(
-                        row["lat"], row["lon"], NEARMAP_FALLBACK_CHIP_M)
+                        lat, lon, NEARMAP_FALLBACK_CHIP_M)
                 except Exception as e:
                     wide_views, wide_date = {}, None
                     print(f"  [{row['id']}] wide nearmap fetch failed: {e}")

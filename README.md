@@ -58,14 +58,22 @@ assets.csv            # your input — replace the sample rows with real coordin
 
 ## Run
 
-1. Edit `assets.csv` — keep the header row, one asset per line:
+1. Edit `assets.csv` — keep the header row, one asset per line. Each row needs
+   `id` plus **either** decimal `lat`/`lon` (WGS84) **or** a full street
+   `address` (geocoded automatically before imagery is fetched):
 
    ```
-   id,lat,lon
-   site_0001,40.689247,-74.044502
+   id,lat,lon,label,input_confidence
+   site_0001,40.689247,-74.044502,JP,high
+
+   id,address,label,input_confidence
+   site_0002,"350 5th Ave, New York, NY 10118",JP,high
    ```
 
-   (lat/lon in decimal degrees, WGS84 — the format Google Maps shows.)
+   Address geocoding uses the free **US Census Geocoder** (best for CONUS
+   rooftop addresses) and falls back to **OpenStreetMap Nominatim**. Resolved
+   coordinates are written to `results.csv` along with `geocode_source` and
+   `geocode_matched_address`. Set `GEOCODER=nominatim` to skip Census.
 
 2. ```bash
    python asset_classifier.py
