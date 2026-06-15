@@ -1,6 +1,6 @@
 """
 Asset classifier pipeline: coordinates or street address -> NAIP aerial chip
--> Gemini vision classification.
+-> Claude vision classification.
 
 Flow:
   1. Read sites from assets.csv (columns: id; plus lat+lon OR address; optional
@@ -10,8 +10,8 @@ Flow:
   2. Query Microsoft Planetary Computer STAC API for the newest NAIP scene at each point
   3. Windowed-read a chip around the point from the Cloud-Optimized GeoTIFF (no full download)
   4. Optional: if NEARMAP_API_KEY is set, also pull a high-res Nearmap vertical
-     and 45-degree oblique panoramas (N/E/S/W) via the Transactional Content API
-  5. Send all views to Gemini: classify the site (tower vs rooftop), locate the
+     and 45-degree oblique panoramas (N/E/S/W) via the Tile API
+  5. Send all views to Claude: classify the site (tower vs rooftop), locate the
      asset with a bounding box, and assess visible cellular equipment
   6. If still unidentified (rural vert-only), widen the Nearmap AOI to match NAIP
   7. If still unidentified, run a two-stage zoom: scout candidate regions, crop
@@ -21,8 +21,8 @@ Flow:
 
 Setup:
   pip install -r requirements.txt
-  Get a free API key at https://aistudio.google.com/apikey then:
-  export GEMINI_API_KEY=AIza...
+  Get an API key at https://console.anthropic.com/ then:
+  export ANTHROPIC_API_KEY=sk-ant-...
 
 Notes:
   - NAIP covers the continental US only (~0.6-1m resolution, public domain).
@@ -30,6 +30,7 @@ Notes:
   - Chip size: 250m at 0.6m GSD = ~417px square. Good balance of context vs detail.
 """
 
+import base64
 import io
 import json
 import math
@@ -48,8 +49,8 @@ from pyproj import Transformer
 from pystac_client import Client
 import planetary_computer
 from PIL import Image
-from google import genai
-from google.genai import types as genai_types
+import anthropic
+from anthropic import Anthropic
 from dotenv import load_dotenv
 
 try:
@@ -58,23 +59,21 @@ except ImportError:
     def tqdm(iterable, **kwargs):
         return iterable
 
-load_dotenv()  # picks up GEMINI_API_KEY from a local .env file if present
+load_dotenv()  # picks up ANTHROPIC_API_KEY from a local .env file if present
 
 # ----------------------------- configuration --------------------------------
 
 STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
 COLLECTION = "naip"
 CHIP_SIZE_M = 250          # side length of the extracted chip, in meters
-# Each model has its own free-tier daily quota bucket; the script automatically
-# hops to the next model when one runs dry.
+# Primary model first; hops to the next on persistent rate limits or 404.
+_default_models = "claude-sonnet-4-20250514,claude-3-5-haiku-20241022"
 MODELS = [
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-3.5-flash",
-    "gemini-3-flash-preview",
-    "gemini-2.0-flash-lite",
+    m.strip() for m in os.environ.get("CLAUDE_MODELS", _default_models).split(",")
+    if m.strip()
 ]
 _model_idx = 0
+API_DELAY_S = float(os.environ.get("CLAUDE_DELAY_S", "12"))
 INPUT_CSV = "assets.csv"    # columns: id; lat+lon OR address; optional: label, input_confidence
 INPUT_CONFIDENCE_LEVELS = ("high", "medium", "low")
 OUTPUT_CSV = "results.csv"
@@ -225,25 +224,24 @@ Return the same JSON schema. If any plausible cellular equipment is visible, \
 set cell_equipment true and explain which view and shaded/sunlit area shows it.
 """
 
-# Enforced via response_schema so every reply parses into exactly this shape.
+# Enforced via Claude tool input_schema so every reply parses into this shape.
 RESPONSE_SCHEMA = {
-    "type": "OBJECT",
+    "type": "object",
     "properties": {
         "site_type": {
-            "type": "STRING",
+            "type": "string",
             "enum": ["tower", "rooftop", "other", "unclear"],
         },
-        "site_confidence": {"type": "NUMBER"},
-        "site_evidence": {"type": "STRING"},
+        "site_confidence": {"type": "number"},
+        "site_evidence": {"type": "string"},
         "asset_box_2d": {
-            "type": "ARRAY",
-            "items": {"type": "INTEGER"},
-            "nullable": True,
+            "type": "array",
+            "items": {"type": "integer"},
         },
-        "asset_view": {"type": "STRING", "nullable": True},
-        "cell_equipment": {"type": "BOOLEAN", "nullable": True},
-        "cell_equipment_confidence": {"type": "NUMBER"},
-        "cell_equipment_evidence": {"type": "STRING"},
+        "asset_view": {"type": "string"},
+        "cell_equipment": {"type": "boolean"},
+        "cell_equipment_confidence": {"type": "number"},
+        "cell_equipment_evidence": {"type": "string"},
     },
     "required": ["site_type", "site_confidence", "site_evidence"],
 }
@@ -270,18 +268,18 @@ If nothing looks plausible, return an empty candidates array.
 """
 
 SCAN_SCHEMA = {
-    "type": "OBJECT",
+    "type": "object",
     "properties": {
         "candidates": {
-            "type": "ARRAY",
+            "type": "array",
             "items": {
-                "type": "OBJECT",
+                "type": "object",
                 "properties": {
                     "box_2d": {
-                        "type": "ARRAY",
-                        "items": {"type": "INTEGER"},
+                        "type": "array",
+                        "items": {"type": "integer"},
                     },
-                    "reason": {"type": "STRING"},
+                    "reason": {"type": "string"},
                 },
                 "required": ["box_2d", "reason"],
             },
@@ -341,7 +339,7 @@ def normalize_confidence(value, default: float | None = None) -> float | None:
 
 
 def normalize_model_result(res: dict) -> dict:
-    """Fix site_confidence and cell_equipment_confidence after a Gemini JSON reply."""
+    """Fix site_confidence and cell_equipment_confidence after a model JSON reply."""
     if "site_confidence" in res:
         norm = normalize_confidence(res.get("site_confidence"))
         if norm is not None:
@@ -721,81 +719,109 @@ def fetch_nearmap_views(lat: float, lon: float, chip_m: float = NEARMAP_CHIP_M):
 
 # --------------------------- classification stage ---------------------------
 
-def _image_part(img: Image.Image) -> genai_types.Part:
+def _image_block(img: Image.Image) -> dict:
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=90)
-    return genai_types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg")
+    data = base64.standard_b64encode(buf.getvalue()).decode("ascii")
+    return {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": "image/jpeg",
+            "data": data,
+        },
+    }
 
 
-def _call_gemini_json(client: genai.Client, contents: list, schema: dict,
-                      retries: int = 3) -> dict:
-    """Shared Gemini JSON call with model fallback and retry logic."""
-    global _model_idx
-    attempt = 0
-    while True:
-        model = MODELS[_model_idx]
-        try:
-            resp = client.models.generate_content(
-                model=model,
-                contents=contents,
-                config=genai_types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=schema,
-                    max_output_tokens=1000,
-                    # Disable thinking on 2.5+ models: it consumes the output token
-                    # budget and can truncate the JSON. 2.0 models reject the option.
-                    **({"thinking_config": genai_types.ThinkingConfig(thinking_budget=0)}
-                       if not model.startswith("gemini-2.0") else {}),
-                ),
-            )
-            break
-        except genai.errors.APIError as e:
-            # Daily quota dry or model unavailable: hop to the next bucket
-            if (e.code == 404) or (e.code == 429 and "PerDay" in str(e)):
-                _model_idx += 1
-                if _model_idx >= len(MODELS):
-                    raise SystemExit(
-                        "\nAll fallback models are out of daily free-tier quota. "
-                        "Partial results are saved in results.csv.\n"
-                        "Options: wait for the reset (midnight Pacific) and rerun "
-                        "(it resumes automatically), or link billing to the project."
-                    )
-                print(f"  {model} out of quota/unavailable -> "
-                      f"hopping to {MODELS[_model_idx]}")
-                attempt = 0
-                continue
-            # 503 = transient overload, per-minute 429 = rate limit; both retryable
-            if e.code in (429, 503) and attempt < retries:
-                attempt += 1
-                wait = 15 * attempt
-                print(f"  transient {e.code}, retrying in {wait}s "
-                      f"({attempt}/{retries})...")
-                time.sleep(wait)
-                continue
-            raise
-    text = (resp.text or "").strip()
+def _parse_json_fallback(text: str, default: dict) -> dict:
+    text = (text or "").strip()
     start, end = text.find("{"), text.rfind("}")
     if start != -1 and end > start:
         text = text[start:end + 1]
     try:
-        res = json.loads(text)
+        return json.loads(text)
     except json.JSONDecodeError:
-        res = {"site_type": "unclear", "site_confidence": 0.0,
-               "site_evidence": f"unparseable model reply: {text[:200]}"}
-    normalize_model_result(res)
-    res["model"] = model
-    return res
+        return {**default, "site_evidence": f"unparseable model reply: {text[:200]}"}
 
 
-def classify_chip(client: genai.Client, views: list[tuple[str, Image.Image]],
+def _extract_tool_result(resp, tool_name: str, default: dict) -> dict:
+    for block in resp.content:
+        if block.type == "tool_use" and block.name == tool_name:
+            if isinstance(block.input, dict):
+                return dict(block.input)
+    text_parts = [block.text for block in resp.content if block.type == "text"]
+    return _parse_json_fallback("\n".join(text_parts), default)
+
+
+def _call_claude_json(client: Anthropic, content: list, schema: dict,
+                      tool_name: str, retries: int = 3) -> dict:
+    """Shared Claude vision call with tool-based JSON and retry logic."""
+    global _model_idx
+    attempt = 0
+    default = {"site_type": "unclear", "site_confidence": 0.0}
+    while True:
+        model = MODELS[_model_idx]
+        try:
+            resp = client.messages.create(
+                model=model,
+                max_tokens=1000,
+                tools=[{
+                    "name": tool_name,
+                    "description": "Return structured analysis as JSON.",
+                    "input_schema": schema,
+                }],
+                tool_choice={"type": "tool", "name": tool_name},
+                messages=[{"role": "user", "content": content}],
+            )
+            res = _extract_tool_result(resp, tool_name, default)
+            normalize_model_result(res)
+            res["model"] = model
+            return res
+        except anthropic.RateLimitError:
+            if attempt < retries:
+                attempt += 1
+                wait = 15 * attempt
+                print(f"  rate limit on {model}, retrying in {wait}s "
+                      f"({attempt}/{retries})...")
+                time.sleep(wait)
+                continue
+            if _model_idx + 1 < len(MODELS):
+                print(f"  {model} rate limited -> hopping to {MODELS[_model_idx + 1]}")
+                _model_idx += 1
+                attempt = 0
+                continue
+            raise
+        except anthropic.APIStatusError as e:
+            if e.status_code == 404 and _model_idx + 1 < len(MODELS):
+                print(f"  {model} unavailable -> hopping to {MODELS[_model_idx + 1]}")
+                _model_idx += 1
+                attempt = 0
+                continue
+            if e.status_code in (429, 529, 503, 500) and attempt < retries:
+                attempt += 1
+                wait = 15 * attempt
+                print(f"  transient {e.status_code}, retrying in {wait}s "
+                      f"({attempt}/{retries})...")
+                time.sleep(wait)
+                continue
+            if e.status_code in (429, 529) and _model_idx + 1 < len(MODELS):
+                print(f"  {model} overloaded -> hopping to {MODELS[_model_idx + 1]}")
+                _model_idx += 1
+                attempt = 0
+                continue
+            raise
+
+
+def classify_chip(client: Anthropic, views: list[tuple[str, Image.Image]],
                   prompt: str = CLASSIFICATION_PROMPT, retries: int = 3) -> dict:
     """Classify one asset from a list of (label, image) views."""
-    contents = []
+    content = []
     for label, img in views:
-        contents.append(f"View: {label}")
-        contents.append(_image_part(img))
-    contents.append(prompt)
-    return _call_gemini_json(client, contents, RESPONSE_SCHEMA, retries)
+        content.append({"type": "text", "text": f"View: {label}"})
+        content.append(_image_block(img))
+    content.append({"type": "text", "text": prompt})
+    return _call_claude_json(
+        client, content, RESPONSE_SCHEMA, "classify_site", retries)
 
 
 def _valid_box(box) -> list[int] | None:
@@ -843,11 +869,15 @@ def _crop_zoom(img: Image.Image, box: list[int]) -> Image.Image:
     return crop
 
 
-def scout_candidates(client: genai.Client, label: str,
+def scout_candidates(client: Anthropic, label: str,
                      img: Image.Image) -> list[dict]:
-    """Ask Gemini to propose candidate regions on a single top-down image."""
-    contents = [f"View: {label}", _image_part(img), SCAN_PROMPT]
-    res = _call_gemini_json(client, contents, SCAN_SCHEMA)
+    """Ask Claude to propose candidate regions on a single top-down image."""
+    content = [
+        {"type": "text", "text": f"View: {label}"},
+        _image_block(img),
+        {"type": "text", "text": SCAN_PROMPT},
+    ]
+    res = _call_claude_json(client, content, SCAN_SCHEMA, "scan_candidates")
     return res.get("candidates") or []
 
 
@@ -883,7 +913,7 @@ def build_zoom_views(asset_id: str, source_label: str, source_img: Image.Image,
     return zoom_views
 
 
-def run_zoom_stage(client: genai.Client, asset_id: str,
+def run_zoom_stage(client: Anthropic, asset_id: str,
                    context_views: list[tuple[str, Image.Image]],
                    source_label: str, source_img: Image.Image,
                    max_crops: int = ZOOM_MAX_CANDIDATES) -> tuple[dict, int]:
@@ -1130,7 +1160,7 @@ def write_executive_summary(results: list[dict], assets_df: pd.DataFrame):
         "## Pilot run highlights",
         "",
         "This proof-of-concept run combined **free public NAIP imagery**, "
-        "**Nearmap high-resolution + 45° oblique views**, and **Google Gemini "
+        "**Nearmap high-resolution + 45° oblique views**, and **Anthropic Claude "
         "vision AI** to classify six sample assets (2 urban NJ, 4 rural W/C).",
         "",
         "**What worked well:**",
@@ -1168,7 +1198,7 @@ def write_executive_summary(results: list[dict], assets_df: pd.DataFrame):
         "       |",
         "       v",
         "  +----+----+",
-        "  | Gemini  |  AI vision: classify site, locate asset, detect equipment",
+        "  | Claude  |  AI vision: classify site, locate asset, detect equipment",
         "  +----+----+",
         "       |",
         "       v (if rural / still unidentified)",
@@ -1188,7 +1218,7 @@ def write_executive_summary(results: list[dict], assets_df: pd.DataFrame):
         "Catches off-center towers; cheap baseline for the full US |",
         "| **Nearmap** (subscription) | ~7 cm top-down + 45° oblique views | "
         "Makes rooftop antennas and disguised towers (e.g. monopines) visible |",
-        "| **Gemini** (Google AI) | Structured classification from multi-image input | "
+        "| **Claude** (Anthropic) | Structured classification from multi-image input | "
         "Turns imagery into site type, equipment call, and location |",
         "",
         "### Confidence safeguards",
@@ -1446,13 +1476,13 @@ def main():
             EXECUTIVE_SUMMARY_MD, INPUT_CSV)
         return
 
-    if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
+    if not os.environ.get("ANTHROPIC_API_KEY"):
         raise SystemExit(
-            "GEMINI_API_KEY is not set. Get a free key at https://aistudio.google.com/apikey\n"
-            '  PowerShell: $env:GEMINI_API_KEY="AIza..."\n'
-            "  bash/zsh:   export GEMINI_API_KEY=AIza..."
+            "ANTHROPIC_API_KEY is not set. Get a key at https://console.anthropic.com/\n"
+            '  PowerShell: $env:ANTHROPIC_API_KEY="sk-ant-..."\n'
+            "  bash/zsh:   export ANTHROPIC_API_KEY=sk-ant-..."
         )
-    client = genai.Client()  # reads GEMINI_API_KEY from environment
+    client = Anthropic()  # reads ANTHROPIC_API_KEY from environment
 
     print(f"Input:  {INPUT_CSV}")
     print(f"Output: {OUTPUT_CSV} (detail/resume)")
@@ -1512,7 +1542,7 @@ def main():
                 results.append(record)
                 _print_asset_result(record)
                 pd.DataFrame(results).to_csv(OUTPUT_CSV, index=False)
-                time.sleep(12.0)
+                time.sleep(API_DELAY_S)
                 continue
 
             def build_views(nm_views):
@@ -1648,7 +1678,7 @@ def main():
         results.append(record)
         # Rewrite after every row so a mid-run crash never loses completed work
         pd.DataFrame(results).to_csv(OUTPUT_CSV, index=False)
-        time.sleep(12.0)  # well under the free tier's ~10 requests/min limit
+        time.sleep(API_DELAY_S)
 
     write_executive_summary(results, df)
     if report_csv and report_xlsx:
