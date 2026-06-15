@@ -322,6 +322,37 @@ def normalize_input_confidence(value) -> str:
     return level if level in INPUT_CONFIDENCE_LEVELS else "medium"
 
 
+def normalize_confidence(value, default: float | None = None) -> float | None:
+    """Clamp model confidence to 0-1. Values > 1 are treated as wrong-scale output."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return default
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    if v > 1.0:
+        if v <= 10.0:
+            v /= 10.0
+        elif v <= 100.0:
+            v /= 100.0
+        else:
+            v = 1.0
+    return max(0.0, min(1.0, v))
+
+
+def normalize_model_result(res: dict) -> dict:
+    """Fix site_confidence and cell_equipment_confidence after a Gemini JSON reply."""
+    if "site_confidence" in res:
+        norm = normalize_confidence(res.get("site_confidence"))
+        if norm is not None:
+            res["site_confidence"] = norm
+    if "cell_equipment_confidence" in res:
+        norm = normalize_confidence(res.get("cell_equipment_confidence"))
+        if norm is not None:
+            res["cell_equipment_confidence"] = norm
+    return res
+
+
 def build_classification_prompt(row) -> str:
     """Assemble the full classification prompt from base + label + source trust."""
     prompt = CLASSIFICATION_PROMPT
@@ -362,6 +393,7 @@ def maybe_recheck_equipment(client, res: dict, views: list,
                 "site_confidence", res.get("site_confidence"))
             res["site_evidence"] = recheck.get(
                 "site_evidence", res.get("site_evidence"))
+        normalize_model_result(res)
     return res
 
 # ----------------------------- geocoding ------------------------------------
@@ -750,6 +782,7 @@ def _call_gemini_json(client: genai.Client, contents: list, schema: dict,
     except json.JSONDecodeError:
         res = {"site_type": "unclear", "site_confidence": 0.0,
                "site_evidence": f"unparseable model reply: {text[:200]}"}
+    normalize_model_result(res)
     res["model"] = model
     return res
 
@@ -913,12 +946,10 @@ def _format_cell_equip(record: dict) -> str:
 
 
 def _format_confidence(record: dict) -> str | float:
-    conf = record.get("site_confidence")
-    if conf is None or (isinstance(conf, float) and pd.isna(conf)):
+    conf = normalize_confidence(record.get("site_confidence"))
+    if conf is None:
         return "—"
-    if isinstance(conf, (int, float)):
-        return round(float(conf), 2)
-    return conf
+    return round(conf, 2)
 
 
 def pick_review_image_path(asset_id: str, record: dict) -> Path | None:
@@ -1051,7 +1082,16 @@ def write_stakeholder_report(results: list[dict], report_csv: str, report_xlsx: 
     for col, width in widths.items():
         ws.column_dimensions[col].width = width
 
-    wb.save(report_xlsx)
+    try:
+        wb.save(report_xlsx)
+    except PermissionError:
+        alt = str(Path(report_xlsx).with_stem(Path(report_xlsx).stem + "_updated"))
+        wb.save(alt)
+        print(f"Stakeholder report written to {report_csv} and {alt}")
+        print(f"  (Could not overwrite {report_xlsx} — file is open. Close it and "
+              f"re-run --regenerate-report to refresh.)")
+        return
+
     print(f"Stakeholder report written to {report_csv} and {report_xlsx}")
 
 
@@ -1313,6 +1353,41 @@ def _print_run_complete(results: list[dict], run_dir: Path, output_csv: str,
     print(f"  Summary:  {summary_md}", flush=True)
     print("=" * 60 + "\n", flush=True)
 
+
+def regenerate_reports_from_detail(run_root: Path, output_csv: str,
+                                   report_csv: str | None, report_xlsx: str | None,
+                                   summary_md: str, input_csv: str):
+    """Fix confidence values and rebuild report files without API calls."""
+    if not os.path.exists(output_csv):
+        raise SystemExit(f"No detail file found: {output_csv}")
+
+    results = pd.read_csv(output_csv).to_dict("records")
+    fixed = 0
+    for record in results:
+        before = (record.get("site_confidence"), record.get("cell_equipment_confidence"))
+        normalize_model_result(record)
+        after = (record.get("site_confidence"), record.get("cell_equipment_confidence"))
+        if before != after:
+            fixed += 1
+
+    pd.DataFrame(results).to_csv(output_csv, index=False)
+
+    input_path = run_root / Path(input_csv).name
+    assets_df = (pd.read_csv(input_path) if input_path.exists()
+                 else pd.read_csv(input_csv))
+
+    write_executive_summary(results, assets_df)
+    if report_csv and report_xlsx:
+        write_stakeholder_report(results, report_csv, report_xlsx)
+
+    print(f"\nRegenerated reports in {run_root}", flush=True)
+    print(f"  Fixed confidence on {fixed} row(s)", flush=True)
+    print(f"  Detail:  {output_csv}", flush=True)
+    if report_csv:
+        print(f"  Report:  {report_csv}", flush=True)
+        print(f"  Excel:   {report_xlsx}", flush=True)
+    print(f"  Summary: {summary_md}", flush=True)
+
 # --------------------------------- pipeline ---------------------------------
 
 def main():
@@ -1329,7 +1404,13 @@ def main():
                         help="Stakeholder summary CSV filename inside the run folder")
     parser.add_argument("--report-xlsx", default=None,
                         help="Stakeholder Excel with photos inside the run folder")
+    parser.add_argument("--regenerate-report", action="store_true",
+                        help="Fix confidence values and rebuild reports from detail CSV")
     args = parser.parse_args()
+
+    if args.regenerate_report and not args.run_dir:
+        raise SystemExit("--regenerate-report requires --run-dir pointing at an "
+                         "existing run folder (e.g. runs\\2026-06-12_184824_WI)")
 
     INPUT_CSV = args.input
     stem = Path(INPUT_CSV).stem
@@ -1356,8 +1437,14 @@ def main():
         f"{prefix}_EXECUTIVE_SUMMARY.md"
         if stem.endswith("_assets") else "EXECUTIVE_SUMMARY.md"))
 
-    if not args.run_dir:
+    if not args.run_dir and not args.regenerate_report:
         shutil.copy2(INPUT_CSV, run_root / Path(INPUT_CSV).name)
+
+    if args.regenerate_report:
+        regenerate_reports_from_detail(
+            run_root, OUTPUT_CSV, report_csv, report_xlsx,
+            EXECUTIVE_SUMMARY_MD, INPUT_CSV)
+        return
 
     if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
         raise SystemExit(
