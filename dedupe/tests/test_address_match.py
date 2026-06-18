@@ -42,6 +42,36 @@ def test_house_numbers_equivalent_for_range():
     assert house_numbers_equivalent("1525 N 24TH ST", "1520 N 24TH ST") is False
 
 
+def test_house_numbers_equivalent_for_letter_suffix():
+    assert house_numbers_equivalent("4222 W CAPITOL DR", "4222A WEST CAPITOL DR") is True
+    assert house_numbers_equivalent("4222A W CAPITOL DR", "4222B WEST CAPITOL DR") is False
+
+
+def test_address_match_score_treats_letter_suffix_as_exact():
+    score = address_match_score(
+        "4222 W CAPITOL DR, MILWAUKEE, WI 53216",
+        "4222A West Capitol Drive<br>Milwaukee, WI 53216",
+    )
+    assert score == 100
+
+
+def test_house_number_neighbor_auto_net_new():
+    from dedupe.address_match import house_number_neighbor_auto_net_new
+
+    assert house_number_neighbor_auto_net_new(
+        "2059 S 33RD ST, MILWAUKEE, WI 53215",
+        "2053 South 33rd Street, Milwaukee, WI 53215",
+    )
+    assert house_number_neighbor_auto_net_new(
+        "3530 W PIERCE ST, MILWAUKEE, WI 53215",
+        "3522 West Pierce Street, Milwaukee, WI 53215",
+    )
+    assert not house_number_neighbor_auto_net_new(
+        "4222 W CAPITOL DR, MILWAUKEE, WI 53216",
+        "4222A West Capitol Drive, Milwaukee, WI 53216",
+    )
+
+
 def test_address_match_score_similar_streets():
     score = address_match_score(
         "1525 N 24TH ST, MILWAUKEE, WI 53205",

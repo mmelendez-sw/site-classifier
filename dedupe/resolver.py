@@ -13,6 +13,7 @@ from dedupe.address_match import (
     city_mismatch_for_review,
     evaluate_match_features,
     extract_city_from_address,
+    house_number_neighbor_auto_net_new,
     normalize_sf_address,
     street_token_jaccard,
 )
@@ -421,6 +422,9 @@ class SiteResolver:
         )
         features = match_features or match.get("match_features") or {}
         city_mismatch = bool(features.get("city_mismatch"))
+
+        if house_number_neighbor_auto_net_new(incoming_address, candidate_address):
+            return "net_new", combined, "house_number_neighbor", zip_mismatch
 
         if distance_m is not None and distance_m < GEOCODER_COLLISION_MAX_M:
             jaccard = street_token_jaccard(incoming_address, candidate_address)

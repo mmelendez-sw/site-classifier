@@ -127,7 +127,7 @@ def test_resolve_match_status_high_address_far_goes_review():
     assert rule == "high_address_far"
 
 
-def test_resolve_match_status_address_floor_proximity():
+def test_resolve_match_status_address_floor_proximity_neighbors_net_new():
     match = {
         "within_radius": True,
         "combined_score": 61,
@@ -143,8 +143,29 @@ def test_resolve_match_status_address_floor_proximity():
         incoming_address="3530 W PIERCE ST, MILWAUKEE, WI 53215",
         candidate_address="3522 West Pierce Street, Milwaukee, WI 53215",
     )
-    assert status == "review"
-    assert rule == "address_floor_proximity"
+    assert status == "net_new"
+    assert rule == "house_number_neighbor"
+
+
+def test_resolve_match_status_letter_suffix_duplicate():
+    match = {
+        "within_radius": True,
+        "combined_score": 100,
+        "address_score": 100,
+        "proximity_score": 68,
+        "distance_m": 32.0,
+    }
+    status, score, rule, _ = SiteResolver._resolve_match_status(
+        match,
+        search_radius_m=100,
+        incoming_zip="53216",
+        matched_zip="53216",
+        incoming_address="4222 W CAPITOL DR, MILWAUKEE, WI 53216",
+        candidate_address="4222A West Capitol Drive, Milwaukee, WI 53216",
+    )
+    assert status == "duplicate"
+    assert score == 100
+    assert rule == "high_address_exact"
 
 
 def test_is_potential_duplicate_flags_close_net_new():

@@ -13,6 +13,7 @@ from dedupe.constants import (
     ADDRESS_COMPONENT_STREET_WEIGHT,
     ADDRESS_COMPONENT_SUFFIX_WEIGHT,
     CITY_MISMATCH_REJECT_MIN_M,
+    HOUSE_NUMBER_DELTA_AUTO_NET_NEW_MAX,
     HOUSE_NUMBER_DELTA_REJECT,
     STREET_NAME_JACCARD_MIN,
 )
@@ -74,6 +75,7 @@ _STREET_SUFFIX_TOKENS = {
 }
 
 _HOUSE_NUMBER_TOKEN_RE = re.compile(r"^(\d+(?:-\d+)?)\b", re.IGNORECASE)
+_HOUSE_NUMBER_COMPONENT_RE = re.compile(r"^(\d+(?:-\d+)?)([A-Z])?\b", re.IGNORECASE)
 _NON_ALNUM_RE = re.compile(r"[^A-Z0-9\s]+")
 _WS_RE = re.compile(r"\s+")
 _OSM_MARKERS_RE = re.compile(r"\b(?:COUNTY|UNITED STATES)\b", re.IGNORECASE)
@@ -290,31 +292,46 @@ def canonicalize_street_tokens(street: str) -> str:
 
 def parse_house_number_token(street: str) -> tuple[int | None, int | None, int | None]:
     """Return (single, range_start, range_end) parsed from the leading house token."""
+    base, letter, range_start, range_end = parse_house_number_components(street)
+    if range_start is not None and range_end is not None:
+        return None, range_start, range_end
+    if base is not None:
+        return base, None, None
+    return None, None, None
+
+
+def parse_house_number_components(
+    street: str,
+) -> tuple[int | None, str | None, int | None, int | None]:
+    """Return (base_number, letter_suffix, range_start, range_end) from the street line."""
     line = extract_street_line(street).upper()
-    match = re.match(r"^(\d+(?:-\d+)?)\b", line)
+    match = _HOUSE_NUMBER_COMPONENT_RE.match(line)
     if not match:
-        return None, None, None
+        return None, None, None, None
 
     token = match.group(1)
+    letter = match.group(2)
     if "-" in token:
         start_text, end_text = token.split("-", 1)
-        return None, int(start_text), int(end_text)
-    return int(token), None, None
+        return None, letter, int(start_text), int(end_text)
+    return int(token), letter, None, None
 
 
 def extract_house_number(street: str) -> str | None:
     """Return the leading house number token when present."""
     line = extract_street_line(street).upper()
-    match = re.match(r"^(\d+(?:-\d+)?)\b", line)
+    match = _HOUSE_NUMBER_COMPONENT_RE.match(line)
     if not match:
         return None
-    return match.group(1)
+    token = match.group(1)
+    letter = match.group(2) or ""
+    return f"{token}{letter}"
 
 
 def strip_house_number(street: str) -> str:
     """Return the street line without its leading house number token."""
     line = extract_street_line(street).upper()
-    stripped = re.sub(r"^\d+(?:-\d+)?\b", "", line, count=1).strip()
+    stripped = _HOUSE_NUMBER_COMPONENT_RE.sub("", line, count=1).strip()
     return canonicalize_street_tokens(stripped)
 
 
@@ -340,30 +357,48 @@ def strip_street_suffix(canonical_street: str) -> str:
 
 def house_numbers_equivalent(left_street: str, right_street: str) -> bool | None:
     """Return whether house numbers refer to the same delivery point, if known."""
-    left_single, left_start, left_end = parse_house_number_token(left_street)
-    right_single, right_start, right_end = parse_house_number_token(right_street)
+    left_base, left_letter, left_start, left_end = parse_house_number_components(left_street)
+    right_base, right_letter, right_start, right_end = parse_house_number_components(
+        right_street
+    )
 
-    if left_single is None and left_start is None:
+    if left_base is None and left_start is None:
         return None
-    if right_single is None and right_start is None:
+    if right_base is None and right_start is None:
         return None
 
-    if left_single is not None and right_single is not None:
-        return left_single == right_single
-    if left_single is not None and right_start is not None and right_end is not None:
-        return right_start <= left_single <= right_end
-    if right_single is not None and left_start is not None and left_end is not None:
-        return left_start <= right_single <= left_end
+    if left_base is not None and right_base is not None:
+        if left_base != right_base:
+            return False
+        if left_letter and right_letter and left_letter != right_letter:
+            return False
+        return True
+    if left_base is not None and right_start is not None and right_end is not None:
+        return right_start <= left_base <= right_end
+    if right_base is not None and left_start is not None and left_end is not None:
+        return left_start <= right_base <= left_end
     return False
 
 
+def house_number_neighbor_auto_net_new(left_address: str, right_address: str) -> bool:
+    """Same street, small numeric delta, different delivery points → not a duplicate."""
+    if not street_names_match(left_address, right_address):
+        return False
+    if house_numbers_equivalent(left_address, right_address):
+        return False
+    delta = house_number_delta(left_address, right_address)
+    if delta is None:
+        return False
+    return delta <= HOUSE_NUMBER_DELTA_AUTO_NET_NEW_MAX
+
+
 def house_number_delta(left_address: str, right_address: str) -> int | None:
-    """Return absolute house-number delta when both singles are known (R04/R09)."""
-    left_single, _, _ = parse_house_number_token(extract_street_line(left_address))
-    right_single, _, _ = parse_house_number_token(extract_street_line(right_address))
-    if left_single is None or right_single is None:
+    """Return absolute house-number delta when both base numbers are known (R04/R09)."""
+    left_base, _, _, _ = parse_house_number_components(extract_street_line(left_address))
+    right_base, _, _, _ = parse_house_number_components(extract_street_line(right_address))
+    if left_base is None or right_base is None:
         return None
-    return abs(left_single - right_single)
+    return abs(left_base - right_base)
 
 
 def street_names_match(left_address: str, right_address: str) -> bool:
