@@ -10,6 +10,7 @@ from simple_salesforce import Salesforce
 
 from dedupe.address_match import (
     address_match_score,
+    city_mismatch_for_review,
     evaluate_match_features,
     extract_city_from_address,
     normalize_sf_address,
@@ -42,6 +43,8 @@ from dedupe.constants import (
     PROXIMITY_DOWNWEIGHT_ADDRESS_MAX,
     PROXIMITY_SCORE_WEIGHT,
     REVIEW_THRESHOLD,
+    SCORING_MODE_ADDRESS_EXACT,
+    SCORING_MODE_WEIGHTED,
     SF_ADDRESS_FIELD,
     SF_CITY_FIELD,
     SF_LAT_FIELD,
@@ -49,9 +52,12 @@ from dedupe.constants import (
     SF_ZIP_FIELD,
     THRESHOLD_VERSION,
     TIE_BREAKER_CLOSE_MAX_DELTA,
+    TOP_CANDIDATES_MAX,
+    TOP_CANDIDATES_MIN_PREFILTER,
     ZIP_MISMATCH_REVIEW_MAX_M,
 )
 from dedupe.context import build_dataset_context
+from dedupe.match_snapshot import serialize_scored_candidate, top_candidates_json
 from dedupe.soql import build_dedupe_query
 from dedupe.sf_geocode import enrich_missing_sf_coordinates, resolve_sf_coordinates
 from dedupe.spatial import combined_score, haversine_meters, proximity_score
@@ -287,16 +293,41 @@ class SiteResolver:
                 "proximity_score": 0,
                 "combined_score": address_score,
                 "coordinate_source": "missing",
+                "scoring_mode": SCORING_MODE_WEIGHTED,
                 "match_features": features,
             }
 
         lat, lng, coordinate_source = resolved
+        # Geocoded SF fallback shares the incoming pin — proximity is not meaningful.
+        if coordinate_source == "geocoded":
+            features = evaluate_match_features(
+                incoming_address,
+                candidate_address,
+                incoming_city=incoming_city,
+                matched_city=matched_city,
+                distance_m=None,
+            )
+            return {
+                "record": sf_record,
+                "address_score": address_score,
+                "distance_m": None,
+                "within_radius": False,
+                "proximity_score": None,
+                "combined_score": address_score,
+                "coordinate_source": coordinate_source,
+                "scoring_mode": SCORING_MODE_WEIGHTED,
+                "match_features": features,
+            }
+
         distance_m = haversine_meters(incoming_lat, incoming_lng, lat, lng)
         within_radius = distance_m <= search_radius_m
         raw_prox = proximity_score(distance_m, search_radius_m) if within_radius else 0
         prox = SiteResolver._downweight_proximity(address_score, raw_prox)
+        # address_exact_override: strong address matches pin combined_score to
+        # address_score and ignore proximity (documented in README scoring_mode).
         if address_score >= HIGH_ADDRESS_STRONG_MIN:
             combined = address_score
+            scoring_mode = SCORING_MODE_ADDRESS_EXACT
         elif within_radius:
             combined = combined_score(
                 address_score,
@@ -304,8 +335,10 @@ class SiteResolver:
                 address_weight=ADDRESS_SCORE_WEIGHT,
                 proximity_weight=PROXIMITY_SCORE_WEIGHT,
             )
+            scoring_mode = SCORING_MODE_WEIGHTED
         else:
             combined = address_score
+            scoring_mode = SCORING_MODE_WEIGHTED
 
         features = evaluate_match_features(
             incoming_address,
@@ -327,6 +360,7 @@ class SiteResolver:
             "proximity_score": prox,
             "combined_score": combined,
             "coordinate_source": coordinate_source,
+            "scoring_mode": scoring_mode,
             "match_features": features,
         }
 
@@ -550,6 +584,53 @@ class SiteResolver:
         detail += f"; status={status}"
         return detail
 
+    @staticmethod
+    def _build_gated_snapshots(
+        gated: list[dict[str, Any]],
+        *,
+        incoming_address: str,
+        incoming_zip: str | None,
+        search_radius_m: float,
+    ) -> list[dict[str, Any]]:
+        ranked = sorted(
+            gated,
+            key=lambda item: (
+                item.get("combined_score") or 0,
+                item.get("address_score") or 0,
+                -(item.get("distance_m") or float("inf")),
+            ),
+            reverse=True,
+        )
+        snapshots: list[dict[str, Any]] = []
+        for item in ranked:
+            candidate_address = normalize_sf_address(
+                item["record"].get(SF_ADDRESS_FIELD) or item["record"].get("Name") or ""
+            )
+            matched_zip = SiteResolver._normalize_zip(item["record"].get(SF_ZIP_FIELD))
+            _, _, routing_reason, _ = SiteResolver._resolve_match_status(
+                item,
+                search_radius_m=search_radius_m,
+                incoming_zip=incoming_zip,
+                matched_zip=matched_zip,
+                incoming_address=incoming_address,
+                candidate_address=candidate_address,
+                match_features=item.get("match_features"),
+            )
+            snapshots.append(
+                serialize_scored_candidate(item, routing_reason=routing_reason)
+            )
+        return snapshots
+
+    @staticmethod
+    def _build_top_candidates(
+        snapshots: list[dict[str, Any]],
+        *,
+        prefilter_count: int,
+    ) -> list[dict[str, Any]]:
+        if prefilter_count < TOP_CANDIDATES_MIN_PREFILTER:
+            return []
+        return snapshots[:TOP_CANDIDATES_MAX]
+
     def resolve(
         self,
         record: dict[str, Any],
@@ -598,9 +679,21 @@ class SiteResolver:
             search_radius_m=urbanicity.search_radius_m,
         )
         gated = self._gate_passing_candidates(eligible)
+        gated_snapshots = self._build_gated_snapshots(
+            gated,
+            incoming_address=address,
+            incoming_zip=incoming_zip,
+            search_radius_m=urbanicity.search_radius_m,
+        )
         match = self._pick_best_match(gated)
         runner_up = self._pick_runner_up(gated, match)
         match_features = (match or {}).get("match_features")
+        matched_record = match["record"] if match else None
+        city_mismatch = city_mismatch_for_review(
+            incoming_city=incoming_city,
+            matched_city=matched_record.get(SF_CITY_FIELD) if matched_record else None,
+            incoming_address=address,
+        )
         matched_zip = (
             self._normalize_zip(match["record"].get(SF_ZIP_FIELD)) if match else None
         )
@@ -629,8 +722,12 @@ class SiteResolver:
             zip_mismatch = False
 
         potential_duplicate = self.is_potential_duplicate(status=status, match=match)
-        matched_record = match["record"] if match else None
         runner_up_record = runner_up["record"] if runner_up else None
+        top_candidates = self._build_top_candidates(
+            gated_snapshots,
+            prefilter_count=len(filtered_pool),
+        )
+        scoring_mode = match.get("scoring_mode") if match else SCORING_MODE_WEIGHTED
         tie_breaker_close = False
         if match and runner_up:
             tie_breaker_close = abs(
@@ -691,10 +788,12 @@ class SiteResolver:
 
         return {
             "status": status,
+            "status_resolver": status,
+            "status_recommended": status,
             "score": score,
             "address_score": match["address_score"] if match else 0,
             "combined_score": match["combined_score"] if match else 0,
-            "proximity_score": match["proximity_score"] if match else 0,
+            "proximity_score": match["proximity_score"] if match else None,
             "matched_distance_m": match["distance_m"] if match else None,
             "matched_coordinate_source": match.get("coordinate_source") if match else None,
             "matched_record": matched_record,
@@ -703,7 +802,10 @@ class SiteResolver:
             "tie_breaker_close": tie_breaker_close,
             "house_number_delta": (match_features or {}).get("house_number_delta"),
             "suffix_mismatch": bool((match_features or {}).get("suffix_mismatch")),
-            "city_mismatch": bool((match_features or {}).get("city_mismatch")),
+            "city_mismatch": city_mismatch,
+            "scoring_mode": scoring_mode,
+            "top_candidates": top_candidates_json(top_candidates),
+            "_gated_candidates": gated_snapshots,
             "candidate_count": len(pool),
             "spatial_candidate_count": spatial_candidate_count,
             "prefilter_candidate_count": len(filtered_pool),

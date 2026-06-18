@@ -18,9 +18,12 @@ from dedupe.constants import (
     SF_CITY_FIELD,
     SF_STATE_FIELD,
     SF_ZIP_FIELD,
+    THRESHOLD_VERSION,
 )
+from dedupe.address_match import has_parseable_house_number
 from dedupe.context import extract_zip_code
 from dedupe.resolver import SiteResolver
+from dedupe.urbanicity import urbanicity_for_record
 from ingest.normalizer import normalize
 from ingest.scraper import IngestRecord
 from salesforce.sf_client import SalesforceClient
@@ -91,7 +94,11 @@ DEDUPE_RESULT_FIELDS = [
     "routing_reason",
     "proximity_rule",
     "override_reason",
+    "status_resolver",
+    "status_recommended",
     "status_source",
+    "scoring_mode",
+    "top_candidates",
     "zip_mismatch",
     "threshold_version",
     "resolution_detail",
@@ -240,7 +247,8 @@ def _format_export_number(value: Any, *, precision: int = 2) -> Any:
 
 
 def _format_dedupe_export_row(row: dict[str, Any]) -> dict[str, Any]:
-    formatted = {field: row.get(field, "") for field in DEDUPE_RESULT_FIELDS}
+    export_fields = [field for field in DEDUPE_RESULT_FIELDS if not field.startswith("_")]
+    formatted = {field: row.get(field, "") for field in export_fields}
     formatted["lat"] = _format_export_number(row.get("lat"), precision=6)
     formatted["lng"] = _format_export_number(row.get("lng"), precision=6)
     formatted["zip_population"] = _format_export_number(row.get("zip_population"), precision=0)
@@ -365,6 +373,56 @@ def _process_dedupe_record(
             logger.info("         mode: DRY-RUN (no Salesforce writes)")
 
     summary_delta = {"duplicates": 0, "review": 0, "net_new": 0, "errors": 0}
+
+    if not has_parseable_house_number(canonical.get("address")):
+        urbanicity = urbanicity_for_record(canonical)
+        urbanicity_data = urbanicity.as_dict()
+        result_row = {
+            "address": canonical.get("address"),
+            "lat": canonical.get("lat"),
+            "lng": canonical.get("lng"),
+            "zip_code": canonical.get("zip_code"),
+            "urbanicity_tier": urbanicity_data.get("urbanicity_tier"),
+            "zip_population": urbanicity_data.get("zip_population"),
+            "urbanicity_prefilter_radius_m": urbanicity_data.get("search_radius_m"),
+            "status": "net_new",
+            "status_resolver": "net_new",
+            "status_recommended": "net_new",
+            "address_score": 0,
+            "proximity_score": None,
+            "combined_score": 0,
+            "matched_distance_m": None,
+            "matched_coordinate_source": None,
+            "spatial_candidate_count": 0,
+            "prefilter_candidate_count": 0,
+            "potential_duplicate": False,
+            "candidate_count": 0,
+            "matched_id": None,
+            "matched_address": None,
+            "matched_city": None,
+            "matched_state": None,
+            "matched_zip": None,
+            "house_number_delta": None,
+            "suffix_mismatch": False,
+            "city_mismatch": False,
+            "runner_up_id": None,
+            "runner_up_score": None,
+            "tie_breaker_close": False,
+            "routing_reason": "unparseable_input",
+            "proximity_rule": "unparseable_input",
+            "override_reason": "unparseable_input",
+            "status_source": "resolver",
+            "zip_mismatch": False,
+            "scoring_mode": "",
+            "top_candidates": "",
+            "_gated_candidates": [],
+            "threshold_version": THRESHOLD_VERSION,
+            "resolution_detail": "status=net_new; routing_reason=unparseable_input",
+        }
+        summary_delta["net_new"] = 1
+        logger.info("Net-new candidate (unparseable input): %s", canonical["address"])
+        return result_row, summary_delta
+
     resolution = resolver.resolve(canonical)
     status = resolution["status"]
     matched = resolution.get("matched_record") or {}
@@ -380,6 +438,8 @@ def _process_dedupe_record(
         "zip_population": urbanicity.get("zip_population"),
         "urbanicity_prefilter_radius_m": urbanicity.get("search_radius_m"),
         "status": status,
+        "status_resolver": resolution.get("status_resolver"),
+        "status_recommended": resolution.get("status_recommended"),
         "address_score": resolution.get("address_score"),
         "proximity_score": resolution.get("proximity_score"),
         "combined_score": resolution.get("combined_score"),
@@ -405,6 +465,9 @@ def _process_dedupe_record(
         "override_reason": resolution.get("override_reason"),
         "status_source": resolution.get("status_source"),
         "zip_mismatch": resolution.get("zip_mismatch"),
+        "scoring_mode": resolution.get("scoring_mode"),
+        "top_candidates": resolution.get("top_candidates"),
+        "_gated_candidates": resolution.get("_gated_candidates") or [],
         "threshold_version": resolution.get("threshold_version"),
         "resolution_detail": resolution.get("resolution_detail"),
     }
@@ -520,9 +583,11 @@ def run_dedupe_pipeline(
         batch_changes = apply_batch_postprocess(result_rows)
         if verbose and any(batch_changes.values()):
             logger.info(
-                "Batch postprocess — input_dupes=%d matched_id=%d potential=%d",
+                "Batch postprocess — input_dupes=%d near=%d matched_id=%d outliers=%d potential=%d",
                 batch_changes["input_duplicates"],
+                batch_changes["input_duplicates_near"],
                 batch_changes["matched_id_reconciled"],
+                batch_changes["address_exact_outliers"],
                 batch_changes["potential_duplicate_promoted"],
             )
         status_counts = _summarize_result_rows(result_rows)

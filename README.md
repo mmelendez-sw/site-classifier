@@ -82,11 +82,11 @@ SOQL uses `Site_Latitude__c`, `Site_Longitude__c`, `Site_Address__c`, and `Site_
 
 | Tier | ZCTA population | Search radius |
 |------|-----------------|-----------------|
-| Urban | ≥ 25,000 | 50 m |
-| Suburban | 2,500 – 24,999 | 150 m |
+| Urban | ≥ 25,000 | 100 m |
+| Suburban | 2,500 – 24,999 | 100 m |
 | Rural | < 2,500 | 250 m |
 
-Salesforce candidates inside that radius are scored with a combined metric: **65% address fuzzy match + 35% proximity** (100 at the same point, 0 at the radius edge). Status thresholds apply to the combined score when a spatial match exists. Strong address matches **outside** the radius are flagged as `review` with `address_match_outside_radius`.
+Salesforce candidates inside that radius are scored with a combined metric: **65% address fuzzy match + 35% proximity** (100 at the same point, 0 at the radius edge). When `address_score ≥ 90`, the resolver uses **`address_exact_override`**: `combined_score` is pinned to the address score and proximity is ignored. Otherwise `scoring_mode=weighted_blend` applies the 65/35 formula. Rows exported in `dedupe_results.csv` include `scoring_mode`, `status_resolver`, `status_recommended`, and `top_candidates` (when the prefilter pool is noisy).
 
 | Status | Meaning |
 |--------|---------|

@@ -156,5 +156,22 @@ def test_is_potential_duplicate_flags_close_net_new():
     assert SiteResolver.is_potential_duplicate(status="net_new", match=match) is True
 
 
-def test_resolve_returns_status_shape():
-    assert DEFAULT_RADIUS_METERS == 250
+def test_score_candidate_nulls_proximity_for_geocoded_sf_fallback():
+    incoming = "1800 W BECHER ST, MILWAUKEE, WI 53215"
+    sf_record = {
+        "Id": "001",
+        "Site_Address__c": "1800 West Becher Street, Milwaukee, WI 53215",
+        "_dedupe_geocoded_lat": 43.0113,
+        "_dedupe_geocoded_lng": -87.9235,
+    }
+    scored = SiteResolver._score_candidate(
+        incoming,
+        43.0113,
+        -87.9235,
+        sf_record,
+        search_radius_m=100,
+    )
+    assert scored["coordinate_source"] == "geocoded"
+    assert scored["proximity_score"] is None
+    assert scored["distance_m"] is None
+    assert scored["combined_score"] == scored["address_score"]

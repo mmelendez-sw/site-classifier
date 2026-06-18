@@ -189,6 +189,11 @@ def normalize_for_scoring(address: str) -> str:
     return text
 
 
+def has_parseable_house_number(address: str | None) -> bool:
+    """Return False when no leading house number exists after normalization."""
+    return extract_house_number(normalize_for_scoring(address or "")) is not None
+
+
 def extract_street_line(address: str | None) -> str:
     """Return the street portion of an address (drop city, state, zip, country)."""
     text = normalize_for_scoring(address)
@@ -252,6 +257,20 @@ def cities_mismatch(
     """Return True when both cities are known and differ (R05/R14)."""
     left = normalize_city(incoming_city) or extract_city_from_address(incoming_address)
     right = normalize_city(matched_city) or extract_city_from_address(candidate_address)
+    if not left or not right:
+        return False
+    return left != right
+
+
+def city_mismatch_for_review(
+    *,
+    incoming_city: str | None,
+    matched_city: str | None,
+    incoming_address: str | None = None,
+) -> bool:
+    """Reviewer-facing city mismatch: input city vs Salesforce Site_City__c only."""
+    left = normalize_city(incoming_city) or extract_city_from_address(incoming_address or "")
+    right = normalize_city(matched_city)
     if not left or not right:
         return False
     return left != right

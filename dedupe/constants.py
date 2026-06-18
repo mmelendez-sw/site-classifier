@@ -76,6 +76,17 @@ PROX_REVIEW_EXTENDED_MIN_ADDRESS = 80
 # Input batch self-dedupe coordinate rounding (degrees).
 INPUT_DEDUPE_COORD_PRECISION = 5
 
+# Coordinate-near input dedupe (same building, slightly different geocode/string).
+INPUT_NEAR_DEDUPE_MAX_M = 15
+INPUT_NEAR_DEDUPE_HOUSE_MAX_DELTA = 4
+
+# Candidate persistence for reviewer context.
+TOP_CANDIDATES_MAX = 3
+TOP_CANDIDATES_MIN_PREFILTER = 4
+
+SCORING_MODE_WEIGHTED = "weighted_blend"
+SCORING_MODE_ADDRESS_EXACT = "address_exact_override"
+
 SF_OBJECT_NAME = "Site__c"
 SF_LAT_FIELD = "Site_Latitude__c"
 SF_LNG_FIELD = "Site_Longitude__c"
