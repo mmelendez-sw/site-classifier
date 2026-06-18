@@ -49,6 +49,9 @@ class FileSource(BaseSourceAdapter):
         zip_col = _find_column(df, ("zip_code", "zip", "postal_code", "GEO_ZIP_CODE"))
         county_col = _find_column(df, ("county", "County"))
         country_col = _find_column(df, ("country", "Country"))
+        address_col = _find_column(df, ("address", "Address")) or "Address"
+        id_col = _find_column(df, ("id", "site_id"))
+        input_confidence_col = _find_column(df, ("input_confidence",))
 
         records = source_records_from_dataframe(
             df,
@@ -56,6 +59,9 @@ class FileSource(BaseSourceAdapter):
             label=label,
             id_prefix=id_prefix,
             source_url=str(path),
+            address_col=address_col,
+            id_col=id_col,
+            input_confidence_col=input_confidence_col,
             zip_col=zip_col,
             county_col=county_col,
             country_col=country_col,

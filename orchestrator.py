@@ -12,6 +12,12 @@ from typing import Any
 from dotenv import load_dotenv
 
 from classifier.asset_classifier import classify_record
+from dedupe.constants import (
+    SF_ADDRESS_FIELD,
+    SF_CITY_FIELD,
+    SF_STATE_FIELD,
+    SF_ZIP_FIELD,
+)
 from dedupe.resolver import SiteResolver
 from ingest.normalizer import normalize
 from ingest.scraper import IngestRecord
@@ -70,7 +76,7 @@ def _log_review(record: dict[str, Any], resolution: dict[str, Any]) -> None:
             "lng": record.get("lng"),
             "score": resolution.get("score"),
             "matched_id": matched.get("Id"),
-            "matched_address": matched.get("Address__c") or matched.get("Name"),
+            "matched_address": matched.get(SF_ADDRESS_FIELD) or matched.get("Name"),
         })
 
 
@@ -101,13 +107,100 @@ def _normalize_batch(
     return canonical_records, failures
 
 
+def _write_dedupe_results(
+    run_dir: Path,
+    rows: list[dict[str, Any]],
+) -> Path:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    output = run_dir / "dedupe_results.csv"
+    fieldnames = [
+        "address",
+        "lat",
+        "lng",
+        "zip_code",
+        "status",
+        "score",
+        "matched_id",
+        "matched_address",
+        "matched_city",
+        "matched_state",
+        "matched_zip",
+        "candidate_count",
+    ]
+    with output.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    return output
+
+
+def _process_dedupe_record(
+    canonical: dict[str, Any],
+    resolver: SiteResolver,
+    sf_client: SalesforceClient | None,
+    *,
+    dry_run: bool,
+) -> tuple[dict[str, Any], dict[str, int]]:
+    """Resolve one record; optionally log duplicates to Salesforce."""
+    summary_delta = {"duplicates": 0, "review": 0, "net_new": 0, "errors": 0}
+    resolution = resolver.resolve(canonical)
+    status = resolution["status"]
+    matched = resolution.get("matched_record") or {}
+
+    result_row = {
+        "address": canonical.get("address"),
+        "lat": canonical.get("lat"),
+        "lng": canonical.get("lng"),
+        "zip_code": canonical.get("zip_code"),
+        "status": status,
+        "score": resolution.get("score"),
+        "matched_id": matched.get("Id"),
+        "matched_address": matched.get(SF_ADDRESS_FIELD) or matched.get("Name"),
+        "matched_city": matched.get(SF_CITY_FIELD),
+        "matched_state": matched.get(SF_STATE_FIELD),
+        "matched_zip": matched.get(SF_ZIP_FIELD),
+        "candidate_count": resolution.get("candidate_count"),
+    }
+
+    if status == "duplicate":
+        if sf_client and not dry_run:
+            sf_client.log_duplicate(canonical, matched.get("Id", ""))
+        summary_delta["duplicates"] = 1
+        logger.info(
+            "Duplicate%s: %s (score=%s)",
+            " (dry-run)" if dry_run else " skipped",
+            canonical["address"],
+            resolution["score"],
+        )
+        return result_row, summary_delta
+
+    if status == "review":
+        _log_review(canonical, resolution)
+        summary_delta["review"] = 1
+        logger.info(
+            "Review queued: %s (score=%s)",
+            canonical["address"],
+            resolution["score"],
+        )
+        return result_row, summary_delta
+
+    summary_delta["net_new"] = 1
+    logger.info("Net-new candidate: %s", canonical["address"])
+    return result_row, summary_delta
+
+
 def run_dedupe_pipeline(
     raw_records: list[dict[str, Any] | IngestRecord | SourceRecord],
+    *,
+    dry_run: bool = False,
+    run_dir: Path | None = None,
 ) -> dict[str, int]:
     """Normalize source records and run Salesforce dedupe only."""
     canonical_records, failures = _normalize_batch(raw_records)
     resolver = SiteResolver()
-    sf_client = SalesforceClient()
+    sf_client = None if dry_run else SalesforceClient()
+    run_dir = run_dir or RUNS_DIR / f"dedupe_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}"
+    result_rows: list[dict[str, Any]] = []
 
     summary = {
         "processed": len(raw_records),
@@ -131,44 +224,31 @@ def run_dedupe_pipeline(
 
     for canonical in canonical_records:
         try:
-            resolution = resolver.resolve(canonical)
-            status = resolution["status"]
-
-            if status == "duplicate":
-                matched = resolution.get("matched_record") or {}
-                sf_client.log_duplicate(canonical, matched.get("Id", ""))
-                summary["duplicates"] += 1
-                logger.info(
-                    "Duplicate skipped: %s (score=%s)",
-                    canonical["address"],
-                    resolution["score"],
-                )
-                continue
-
-            if status == "review":
-                _log_review(canonical, resolution)
-                summary["review"] += 1
-                logger.info(
-                    "Review queued: %s (score=%s)",
-                    canonical["address"],
-                    resolution["score"],
-                )
-                continue
-
-            summary["net_new"] += 1
-            logger.info("Net-new candidate: %s", canonical["address"])
-
+            result_row, delta = _process_dedupe_record(
+                canonical,
+                resolver,
+                sf_client,
+                dry_run=dry_run,
+            )
+            result_rows.append(result_row)
+            for key, value in delta.items():
+                summary[key] += value
         except Exception as exc:
             summary["errors"] += 1
             logger.exception("Failed to dedupe record: %s", exc)
 
+    if result_rows:
+        output = _write_dedupe_results(run_dir, result_rows)
+        logger.info("Wrote dedupe results to %s", output)
+
     logger.info(
-        "Dedupe summary — processed=%s duplicates=%s review=%s net_new=%s errors=%s",
+        "Dedupe summary — processed=%s duplicates=%s review=%s net_new=%s errors=%s%s",
         summary["processed"],
         summary["duplicates"],
         summary["review"],
         summary["net_new"],
         summary["errors"],
+        " (dry-run, no Salesforce writes)" if dry_run else "",
     )
     return summary
 
@@ -177,20 +257,22 @@ def main(
     raw_records: list[dict[str, Any] | IngestRecord | SourceRecord] | None = None,
     *,
     classify: bool = True,
+    dry_run: bool = False,
 ) -> dict[str, int]:
     """Process records through normalize, dedupe, optional classify, and load."""
     if raw_records is None:
         raw_records = []
 
     if not classify:
-        return run_dedupe_pipeline(raw_records)
+        return run_dedupe_pipeline(raw_records, dry_run=dry_run)
 
     canonical_records, failures = _normalize_batch(raw_records)
     run_dir = RUNS_DIR / f"orchestrator_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
     resolver = SiteResolver()
-    sf_client = SalesforceClient()
+    sf_client = None if dry_run else SalesforceClient()
+    result_rows: list[dict[str, Any]] = []
 
     summary = {
         "processed": len(raw_records),
@@ -210,48 +292,48 @@ def main(
 
     for canonical in canonical_records:
         try:
-            resolution = resolver.resolve(canonical)
-            status = resolution["status"]
+            result_row, delta = _process_dedupe_record(
+                canonical,
+                resolver,
+                sf_client,
+                dry_run=dry_run,
+            )
+            result_rows.append(result_row)
+            for key, value in delta.items():
+                summary[key] += value
 
-            if status == "duplicate":
-                matched = resolution.get("matched_record") or {}
-                sf_client.log_duplicate(canonical, matched.get("Id", ""))
-                summary["duplicates"] += 1
-                logger.info(
-                    "Duplicate skipped: %s (score=%s)",
-                    canonical["address"],
-                    resolution["score"],
-                )
+            if result_row["status"] != "net_new":
                 continue
 
-            if status == "review":
-                _log_review(canonical, resolution)
-                summary["review"] += 1
-                logger.info(
-                    "Review queued: %s (score=%s)",
-                    canonical["address"],
-                    resolution["score"],
-                )
-                continue
-
-            summary["net_new"] += 1
             classified = classify_record(canonical, run_dir=run_dir)
-            sf_client.create_site(classified)
-            summary["loaded"] += 1
-            logger.info("Loaded net-new site: %s", canonical["address"])
+            if sf_client and not dry_run:
+                sf_client.create_site(classified)
+                summary["loaded"] += 1
+                logger.info("Loaded net-new site: %s", canonical["address"])
+            else:
+                logger.info(
+                    "Classified net-new site%s: %s",
+                    " (dry-run, not uploaded)" if dry_run else "",
+                    canonical["address"],
+                )
 
         except Exception as exc:
             summary["errors"] += 1
             logger.exception("Failed to process record: %s", exc)
 
+    if result_rows:
+        output = _write_dedupe_results(run_dir, result_rows)
+        logger.info("Wrote dedupe results to %s", output)
+
     logger.info(
-        "Summary — processed=%s duplicates=%s review=%s net_new=%s loaded=%s errors=%s",
+        "Summary — processed=%s duplicates=%s review=%s net_new=%s loaded=%s errors=%s%s",
         summary["processed"],
         summary["duplicates"],
         summary["review"],
         summary["net_new"],
         summary["loaded"],
         summary["errors"],
+        " (dry-run, no Salesforce writes)" if dry_run else "",
     )
     return summary
 
@@ -260,13 +342,14 @@ def run_from_source(
     source_name: str,
     *,
     classify: bool = False,
+    dry_run: bool = False,
     scope: Any = None,
     **source_kwargs: Any,
 ) -> dict[str, int]:
     """Run a permit source adapter, then hand off to ingest + Salesforce dedupe."""
     records = run_source(source_name, scope=scope, **source_kwargs)
     logger.info("Source '%s' produced %s records", source_name, len(records))
-    return main(records, classify=classify)
+    return main(records, classify=classify, dry_run=dry_run)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -284,6 +367,11 @@ def _parse_args() -> argparse.Namespace:
         "--classify",
         action="store_true",
         help="Run classifier + Salesforce load for net-new records",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Query Salesforce for dedupe but do not create sites or duplicate logs",
     )
     parser.add_argument("--country", help="Country scope (e.g. US)")
     parser.add_argument("--state", help="State scope (e.g. WI)")
@@ -326,6 +414,7 @@ if __name__ == "__main__":
         run_from_source(
             args.source,
             classify=args.classify,
+            dry_run=args.dry_run,
             scope=scope,
             **source_kwargs,
         )

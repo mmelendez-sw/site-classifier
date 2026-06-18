@@ -78,7 +78,7 @@ Before matching, the orchestrator **prefetches** Salesforce candidates for the e
 1. All **zip codes** found in the dataset
 2. One bounding box from the dataset **min/max lat/lng**, expanded by **±250m** (dataset-wide, not per site)
 
-SOQL uses `Site_Latitude__c`, `Site_Longitude__c`, and `Zip_Code__c`. Fuzzy address matching (`rapidfuzz`) assigns each record a status:
+SOQL uses `Site_Latitude__c`, `Site_Longitude__c`, `Site_Address__c`, and `Site_Zip_Code__c`. Fuzzy address matching (`rapidfuzz`) assigns each record a status:
 
 | Status | Meaning |
 |--------|---------|

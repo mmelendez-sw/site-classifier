@@ -20,6 +20,8 @@ def source_records_from_dataframe(
     zip_col: str | None = None,
     county_col: str | None = None,
     country_col: str | None = None,
+    id_col: str | None = None,
+    input_confidence_col: str | None = None,
     label: str | None = None,
     id_prefix: str | None = None,
     metadata_cols: list[str] | None = None,
@@ -28,7 +30,16 @@ def source_records_from_dataframe(
     """Convert a permit dataframe into SourceRecord objects."""
     prefix = (id_prefix or label or source_name).lower().replace(" ", "_")
     records: list[SourceRecord] = []
-    reserved = {address_col, city_col, state_col, zip_col, county_col, country_col}
+    reserved = {
+        address_col,
+        city_col,
+        state_col,
+        zip_col,
+        county_col,
+        country_col,
+        id_col,
+        input_confidence_col,
+    }
     reserved = {col for col in reserved if col}
     meta_cols = metadata_cols or [c for c in df.columns if c not in reserved]
 
@@ -37,15 +48,20 @@ def source_records_from_dataframe(
         if not address or address.lower() == "nan":
             continue
         site_num = int(idx) + 1
+        site_id = _optional_str(row.get(id_col)) if id_col else None
+        input_confidence = (
+            _optional_str(row.get(input_confidence_col)) if input_confidence_col else None
+        )
         records.append(SourceRecord(
-            site_id=f"{prefix}_{site_num:03d}",
+            site_id=site_id or f"{prefix}_{site_num:03d}",
             address=address,
             city=_optional_str(row.get(city_col)),
             state=_optional_str(row.get(state_col)),
             county=_optional_str(row.get(county_col)) if county_col else None,
             country=_optional_str(row.get(country_col)) if country_col else None,
             zip_code=_optional_str(row.get(zip_col)) if zip_col else None,
-            label=label or _optional_str(row.get(state_col)),
+            label=label or _optional_str(row.get("label")) or _optional_str(row.get(state_col)),
+            input_confidence=input_confidence or "high",
             permit_metadata={
                 col: _clean_value(row.get(col))
                 for col in meta_cols

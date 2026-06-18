@@ -68,8 +68,8 @@ def _env_flag(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() in ("1", "true", "yes")
 
 
-NEARMAP_TIERED = _env_flag("NEARMAP_TIERED")
-BIFURCATED_AI = _env_flag("BIFURCATED_AI")
+NEARMAP_TIERED = _env_flag("NEARMAP_TIERED", default="1")
+BIFURCATED_AI = _env_flag("BIFURCATED_AI", default="1")
 NAIP_ONLY = _env_flag("NAIP_ONLY")
 TIER_CONF_HIGH = float(os.environ.get("TIER_CONF_HIGH", "0.75"))
 TIER_CONF_MEDIUM = float(os.environ.get("TIER_CONF_MEDIUM", "0.6"))

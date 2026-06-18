@@ -7,7 +7,7 @@ from salesforce.sf_client import SalesforceClient
 def test_field_map_includes_core_site_fields():
     assert FIELD_MAP["lat"] == "Site_Latitude__c"
     assert FIELD_MAP["lng"] == "Site_Longitude__c"
-    assert FIELD_MAP["address"] == "Address__c"
+    assert FIELD_MAP["address"] == "Site_Address__c"
 
 
 def test_create_site_maps_payload():

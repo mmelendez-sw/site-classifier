@@ -3,8 +3,8 @@
 FIELD_MAP: dict[str, str] = {
     "lat": "Site_Latitude__c",
     "lng": "Site_Longitude__c",
-    "zip_code": "Zip_Code__c",
-    "address": "Address__c",
+    "zip_code": "Site_Zip_Code__c",
+    "address": "Site_Address__c",
     "permit_metadata": "Permit_Metadata__c",
     "site_type": "Site_Type__c",
     "site_confidence": "Site_Confidence__c",

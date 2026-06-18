@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from dedupe.constants import (
     SF_ADDRESS_FIELD,
+    SF_CITY_FIELD,
     SF_LAT_FIELD,
     SF_LNG_FIELD,
     SF_OBJECT_NAME,
+    SF_STATE_FIELD,
     SF_ZIP_FIELD,
 )
 
@@ -29,7 +31,8 @@ def build_bbox_query(
 ) -> str:
     """Build a SOQL query for site records within a lat/lng bounding box."""
     return (
-        f"SELECT Id, Name, {lat_field}, {lng_field}, {address_field}, {zip_field} "
+        f"SELECT Id, Name, {lat_field}, {lng_field}, {address_field}, "
+        f"{SF_CITY_FIELD}, {SF_STATE_FIELD}, {zip_field} "
         f"FROM {object_name} "
         f"WHERE {lat_field} >= {min_lat} AND {lat_field} <= {max_lat} "
         f"AND {lng_field} >= {min_lng} AND {lng_field} <= {max_lng}"
@@ -60,6 +63,7 @@ def build_dedupe_query(
 
     where = " OR ".join(clauses)
     return (
-        f"SELECT Id, Name, {lat_field}, {lng_field}, {address_field}, {zip_field} "
+        f"SELECT Id, Name, {lat_field}, {lng_field}, {address_field}, "
+        f"{SF_CITY_FIELD}, {SF_STATE_FIELD}, {zip_field} "
         f"FROM {object_name} WHERE {where}"
     )
