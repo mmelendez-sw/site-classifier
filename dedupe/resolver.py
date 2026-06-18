@@ -23,12 +23,8 @@ from dedupe.constants import (
 )
 from dedupe.context import build_dataset_context
 from dedupe.soql import build_dedupe_query
-from dedupe.spatial import (
-    combined_score,
-    haversine_meters,
-    proximity_score,
-    sf_coordinates,
-)
+from dedupe.sf_geocode import enrich_missing_sf_coordinates, resolve_sf_coordinates
+from dedupe.spatial import combined_score, haversine_meters, proximity_score, sf_coordinates
 from dedupe.urbanicity import UrbanicityProfile, urbanicity_for_record
 
 
@@ -120,15 +116,14 @@ class SiteResolver:
             logger.info("  executing query...")
 
         self._candidate_cache = self.query_salesforce(zip_codes=zip_codes, bbox=bbox)
+        enrich_missing_sf_coordinates(self._candidate_cache, verbose=self.verbose)
 
         if self.verbose:
             with_coords = sum(
-                1
-                for row in self._candidate_cache
-                if row.get(SF_LAT_FIELD) is not None and row.get(SF_LNG_FIELD) is not None
+                1 for row in self._candidate_cache if resolve_sf_coordinates(row) is not None
             )
             logger.info(
-                "  returned %d Site__c rows (%d with lat/lng for spatial matching)",
+                "  returned %d Site__c rows (%d with coordinates for spatial matching)",
                 len(self._candidate_cache),
                 with_coords,
             )
@@ -237,9 +232,9 @@ class SiteResolver:
             sf_record.get(SF_ADDRESS_FIELD) or sf_record.get("Name") or ""
         )
         address_score = fuzz.token_sort_ratio(incoming_address, candidate_address)
-        coords = sf_coordinates(sf_record, lat_field=SF_LAT_FIELD, lng_field=SF_LNG_FIELD)
+        resolved = resolve_sf_coordinates(sf_record)
 
-        if coords is None:
+        if resolved is None:
             return {
                 "record": sf_record,
                 "address_score": address_score,
@@ -247,9 +242,11 @@ class SiteResolver:
                 "within_radius": False,
                 "proximity_score": 0,
                 "combined_score": address_score,
+                "coordinate_source": "missing",
             }
 
-        distance_m = haversine_meters(incoming_lat, incoming_lng, coords[0], coords[1])
+        lat, lng, coordinate_source = resolved
+        distance_m = haversine_meters(incoming_lat, incoming_lng, lat, lng)
         within_radius = distance_m <= search_radius_m
         prox = proximity_score(distance_m, search_radius_m) if within_radius else 0
         combined = (
@@ -269,6 +266,7 @@ class SiteResolver:
             "within_radius": within_radius,
             "proximity_score": prox,
             "combined_score": combined,
+            "coordinate_source": coordinate_source,
         }
 
     @staticmethod
@@ -306,13 +304,15 @@ class SiteResolver:
         distance_text = (
             f"{match['distance_m']:.0f}m"
             if match.get("distance_m") is not None
-            else "no_sf_coordinates"
+            else "no_coordinates"
         )
+        coord_source = match.get("coordinate_source") or "missing"
         detail = (
             f"{urbanicity.tier} zip population={pop_text} radius={radius}m "
             f"spatial_candidates={spatial_candidate_count}; "
             f"address_score={match['address_score']} proximity_score={match['proximity_score']} "
-            f"combined_score={match['combined_score']} distance={distance_text}"
+            f"combined_score={match['combined_score']} distance={distance_text} "
+            f"coord_source={coord_source}"
         )
         if used_outside_radius_match:
             detail += "; address_match_outside_radius"
@@ -412,12 +412,13 @@ class SiteResolver:
                 dist = (
                     f"{match['distance_m']:.0f}m"
                     if match.get("distance_m") is not None
-                    else "no_sf_coordinates"
+                    else "no_coordinates"
                 )
                 logger.info(
-                    "    best match : %s | %s",
+                    "    best match : %s | %s (coords=%s)",
                     matched.get("Id", "—"),
                     matched_addr[:80],
+                    match.get("coordinate_source", "missing"),
                 )
                 logger.info(
                     "    scores     : address=%s proximity=%s combined=%s distance=%s",
@@ -435,6 +436,7 @@ class SiteResolver:
             "combined_score": match["combined_score"] if match else 0,
             "proximity_score": match["proximity_score"] if match else 0,
             "matched_distance_m": match["distance_m"] if match else None,
+            "matched_coordinate_source": match.get("coordinate_source") if match else None,
             "matched_record": matched_record,
             "candidate_count": len(pool),
             "spatial_candidate_count": spatial_candidate_count,
