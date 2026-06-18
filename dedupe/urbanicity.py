@@ -1,4 +1,9 @@
-"""Zip-code population lookup and urbanicity search-radius tiers."""
+"""Zip-code population lookup and urbanicity search-radius tiers.
+
+Population data comes from a configurable CSV of US ZCTA (zip code tabulation area)
+counts. Point ``ZIP_POPULATION_CSV`` at a nationwide Census export or a regional subset;
+unknown zips fall back to the suburban tier and radius.
+"""
 
 from __future__ import annotations
 

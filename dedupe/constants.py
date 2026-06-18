@@ -4,7 +4,7 @@ DUPLICATE_THRESHOLD = 85
 REVIEW_THRESHOLD = 60
 DEFAULT_RADIUS_METERS = 250
 
-# Urbanicity tiers from ZCTA population (see data/zip_populations.csv).
+# Urbanicity tiers from ZCTA population (nationwide CSV — see ZIP_POPULATION_CSV).
 URBAN_POPULATION_MIN = 25_000
 SUBURBAN_POPULATION_MIN = 2_500
 URBAN_RADIUS_M = 50
@@ -16,9 +16,23 @@ URBANICITY_DEFAULT_TIER = "suburban"
 ADDRESS_SCORE_WEIGHT = 0.65
 PROXIMITY_SCORE_WEIGHT = 0.35
 
-# Max distance (meters) for an outside-radius address match to count as review/duplicate.
-# Beyond this, fuzzy-only matches from the zip/bbox pool are treated as net_new.
-OUTSIDE_RADIUS_REVIEW_MAX_M = 500
+# Outside-radius fuzzy matches never promote to review/duplicate (in-radius only).
+OUTSIDE_RADIUS_REVIEW_MAX_M = 0
+
+# Only fuzzy-score Salesforce candidates within this distance of the incoming pin.
+FUZZY_PREFILTER_MAX_M = 500
+
+# Flag net-new rows that are close and moderately similar for manual calibration.
+POTENTIAL_DUPLICATE_MIN_COMBINED = 50
+POTENTIAL_DUPLICATE_MAX_DISTANCE_M = 100
+
+# Proximity-aware promotion when combined score alone is below DUPLICATE_THRESHOLD.
+PROX_DUPLICATE_MAX_M = 25
+PROX_DUPLICATE_MIN_ADDRESS = 75
+PROX_REVIEW_MAX_M = 50
+PROX_REVIEW_MIN_ADDRESS = 70
+PROX_REVIEW_EXTENDED_MAX_M = 100
+PROX_REVIEW_EXTENDED_MIN_ADDRESS = 80
 
 SF_OBJECT_NAME = "Site__c"
 SF_LAT_FIELD = "Site_Latitude__c"

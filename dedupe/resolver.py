@@ -6,14 +6,22 @@ import math
 import os
 from typing import Any
 
-from rapidfuzz import fuzz
 from simple_salesforce import Salesforce
 
+from dedupe.address_match import address_match_score, normalize_sf_address
 from dedupe.constants import (
     ADDRESS_SCORE_WEIGHT,
     DEFAULT_RADIUS_METERS,
     DUPLICATE_THRESHOLD,
-    OUTSIDE_RADIUS_REVIEW_MAX_M,
+    FUZZY_PREFILTER_MAX_M,
+    POTENTIAL_DUPLICATE_MAX_DISTANCE_M,
+    POTENTIAL_DUPLICATE_MIN_COMBINED,
+    PROX_DUPLICATE_MAX_M,
+    PROX_DUPLICATE_MIN_ADDRESS,
+    PROX_REVIEW_EXTENDED_MAX_M,
+    PROX_REVIEW_EXTENDED_MIN_ADDRESS,
+    PROX_REVIEW_MAX_M,
+    PROX_REVIEW_MIN_ADDRESS,
     PROXIMITY_SCORE_WEIGHT,
     REVIEW_THRESHOLD,
     SF_ADDRESS_FIELD,
@@ -24,7 +32,7 @@ from dedupe.constants import (
 from dedupe.context import build_dataset_context
 from dedupe.soql import build_dedupe_query
 from dedupe.sf_geocode import enrich_missing_sf_coordinates, resolve_sf_coordinates
-from dedupe.spatial import combined_score, haversine_meters, proximity_score, sf_coordinates
+from dedupe.spatial import combined_score, haversine_meters, proximity_score
 from dedupe.urbanicity import UrbanicityProfile, urbanicity_for_record
 
 
@@ -164,16 +172,11 @@ class SiteResolver:
         best_record: dict[str, Any] | None = None
         for record in sf_records:
             candidate = record.get(SF_ADDRESS_FIELD) or record.get("Name") or ""
-            score = fuzz.token_sort_ratio(incoming_address, candidate)
+            score = address_match_score(incoming_address, candidate)
             if score > best_score:
                 best_score = score
                 best_record = record
         return best_score, best_record
-
-    @staticmethod
-    def _normalize_sf_address(value: Any) -> str:
-        text = str(value or "")
-        return text.replace("<br>", " ").replace("<BR>", " ").strip()
 
     @staticmethod
     def _normalize_zip(value: Any) -> str | None:
@@ -185,39 +188,29 @@ class SiteResolver:
         return None
 
     @staticmethod
-    def _outside_radius_review_cap(search_radius_m: float) -> float:
-        return max(search_radius_m * 3, float(OUTSIDE_RADIUS_REVIEW_MAX_M))
-
-    @staticmethod
-    def _resolve_outside_radius_match(
-        best_outside: dict[str, Any],
+    def _prefilter_candidates(
+        pool: list[dict[str, Any]],
         *,
+        incoming_lat: float,
+        incoming_lng: float,
         incoming_zip: str | None,
-        search_radius_m: float,
-    ) -> tuple[str, int, bool]:
-        """Decide status for the best address match outside the urbanicity circle."""
-        score = best_outside["address_score"]
-        matched_zip = SiteResolver._normalize_zip(best_outside["record"].get(SF_ZIP_FIELD))
-        distance_m = best_outside.get("distance_m")
-        max_review_m = SiteResolver._outside_radius_review_cap(search_radius_m)
+        max_distance_m: float,
+    ) -> list[dict[str, Any]]:
+        """Keep only nearby Salesforce rows (or same-zip rows missing coordinates)."""
+        filtered: list[dict[str, Any]] = []
+        for record in pool:
+            resolved = resolve_sf_coordinates(record)
+            if resolved is not None:
+                lat, lng, _ = resolved
+                if haversine_meters(incoming_lat, incoming_lng, lat, lng) <= max_distance_m:
+                    filtered.append(record)
+                continue
 
-        if distance_m is not None and distance_m > max_review_m:
-            return "net_new", score, False
+            matched_zip = SiteResolver._normalize_zip(record.get(SF_ZIP_FIELD))
+            if incoming_zip and matched_zip and incoming_zip == matched_zip:
+                filtered.append(record)
 
-        if distance_m is None:
-            if not (incoming_zip and matched_zip and incoming_zip == matched_zip):
-                return "net_new", score, False
-            if score >= DUPLICATE_THRESHOLD:
-                return "duplicate", score, True
-            if score >= REVIEW_THRESHOLD:
-                return "review", score, True
-            return "net_new", score, False
-
-        if score >= DUPLICATE_THRESHOLD:
-            return "duplicate", score, True
-        if score >= REVIEW_THRESHOLD:
-            return "review", score, True
-        return "net_new", score, False
+        return filtered
 
     @staticmethod
     def _score_candidate(
@@ -228,10 +221,10 @@ class SiteResolver:
         *,
         search_radius_m: float,
     ) -> dict[str, Any]:
-        candidate_address = SiteResolver._normalize_sf_address(
+        candidate_address = normalize_sf_address(
             sf_record.get(SF_ADDRESS_FIELD) or sf_record.get("Name") or ""
         )
-        address_score = fuzz.token_sort_ratio(incoming_address, candidate_address)
+        address_score = address_match_score(incoming_address, candidate_address)
         resolved = resolve_sf_coordinates(sf_record)
 
         if resolved is None:
@@ -276,7 +269,7 @@ class SiteResolver:
         return max(candidates, key=lambda item: item[key])
 
     @staticmethod
-    def _status_from_score(score: int) -> str:
+    def _status_from_combined_score(score: int) -> str:
         if score >= DUPLICATE_THRESHOLD:
             return "duplicate"
         if score >= REVIEW_THRESHOLD:
@@ -284,13 +277,49 @@ class SiteResolver:
         return "net_new"
 
     @staticmethod
+    def _resolve_in_radius_status(match: dict[str, Any]) -> tuple[str, int]:
+        """Apply proximity-aware rules, then combined-score thresholds."""
+        combined = match["combined_score"]
+        address_score = match["address_score"]
+        distance_m = match.get("distance_m")
+
+        if distance_m is not None:
+            if distance_m <= PROX_DUPLICATE_MAX_M and address_score >= PROX_DUPLICATE_MIN_ADDRESS:
+                return "duplicate", combined
+            if distance_m <= PROX_REVIEW_MAX_M and address_score >= PROX_REVIEW_MIN_ADDRESS:
+                return "review", combined
+            if (
+                distance_m <= PROX_REVIEW_EXTENDED_MAX_M
+                and address_score >= PROX_REVIEW_EXTENDED_MIN_ADDRESS
+            ):
+                return "review", combined
+
+        return SiteResolver._status_from_combined_score(combined), combined
+
+    @staticmethod
+    def is_potential_duplicate(
+        *,
+        status: str,
+        match: dict[str, Any] | None,
+    ) -> bool:
+        if status != "net_new" or match is None:
+            return False
+        if not match.get("within_radius"):
+            return False
+        distance_m = match.get("distance_m")
+        if distance_m is None or distance_m > POTENTIAL_DUPLICATE_MAX_DISTANCE_M:
+            return False
+        return match["combined_score"] >= POTENTIAL_DUPLICATE_MIN_COMBINED
+
+    @staticmethod
     def _build_resolution_detail(
         *,
         urbanicity: UrbanicityProfile,
         spatial_candidate_count: int,
+        prefilter_count: int,
         match: dict[str, Any] | None,
         status: str,
-        used_outside_radius_match: bool,
+        proximity_rule: str | None,
     ) -> str:
         radius = int(urbanicity.search_radius_m)
         pop = urbanicity.population
@@ -298,7 +327,8 @@ class SiteResolver:
         if match is None:
             return (
                 f"{urbanicity.tier} zip population={pop_text} radius={radius}m "
-                f"spatial_candidates=0/{spatial_candidate_count}; no Salesforce match"
+                f"prefilter={prefilter_count} spatial_candidates=0/{spatial_candidate_count}; "
+                f"no in-radius Salesforce match"
             )
 
         distance_text = (
@@ -309,21 +339,34 @@ class SiteResolver:
         coord_source = match.get("coordinate_source") or "missing"
         detail = (
             f"{urbanicity.tier} zip population={pop_text} radius={radius}m "
-            f"spatial_candidates={spatial_candidate_count}; "
+            f"prefilter={prefilter_count} spatial_candidates={spatial_candidate_count}; "
             f"address_score={match['address_score']} proximity_score={match['proximity_score']} "
             f"combined_score={match['combined_score']} distance={distance_text} "
             f"coord_source={coord_source}"
         )
-        if used_outside_radius_match:
-            detail += "; address_match_outside_radius"
-        elif (
-            match is not None
-            and match.get("distance_m") is not None
-            and match["distance_m"] > urbanicity.search_radius_m
-        ):
-            detail += "; address_match_too_far_for_review"
+        if proximity_rule:
+            detail += f"; proximity_rule={proximity_rule}"
         detail += f"; status={status}"
         return detail
+
+    @staticmethod
+    def _proximity_rule_label(match: dict[str, Any], status: str) -> str | None:
+        if status == "net_new":
+            return None
+        distance_m = match.get("distance_m")
+        address_score = match["address_score"]
+        if distance_m is None:
+            return None
+        if status == "duplicate" and distance_m <= PROX_DUPLICATE_MAX_M:
+            if address_score >= PROX_DUPLICATE_MIN_ADDRESS:
+                return f"<= {int(PROX_DUPLICATE_MAX_M)}m addr>={PROX_DUPLICATE_MIN_ADDRESS}"
+        if status == "review" and distance_m <= PROX_REVIEW_MAX_M:
+            if address_score >= PROX_REVIEW_MIN_ADDRESS:
+                return f"<= {int(PROX_REVIEW_MAX_M)}m addr>={PROX_REVIEW_MIN_ADDRESS}"
+        if status == "review" and distance_m <= PROX_REVIEW_EXTENDED_MAX_M:
+            if address_score >= PROX_REVIEW_EXTENDED_MIN_ADDRESS:
+                return f"<= {int(PROX_REVIEW_EXTENDED_MAX_M)}m addr>={PROX_REVIEW_EXTENDED_MIN_ADDRESS}"
+        return None
 
     def resolve(
         self,
@@ -334,6 +377,7 @@ class SiteResolver:
         address = record["address"]
         incoming_lat = float(record["lat"])
         incoming_lng = float(record["lng"])
+        incoming_zip = self._normalize_zip(record.get("zip_code"))
         urbanicity = urbanicity_for_record(record)
 
         pool = candidates if candidates is not None else self._candidate_cache
@@ -344,6 +388,15 @@ class SiteResolver:
                 "lat/lng, not a per-site radius."
             )
 
+        prefilter_max_m = max(urbanicity.search_radius_m, float(FUZZY_PREFILTER_MAX_M))
+        filtered_pool = self._prefilter_candidates(
+            pool,
+            incoming_lat=incoming_lat,
+            incoming_lng=incoming_lng,
+            incoming_zip=incoming_zip,
+            max_distance_m=prefilter_max_m,
+        )
+
         scored = [
             self._score_candidate(
                 address,
@@ -352,43 +405,31 @@ class SiteResolver:
                 sf_record,
                 search_radius_m=urbanicity.search_radius_m,
             )
-            for sf_record in pool
+            for sf_record in filtered_pool
         ]
         in_radius = [item for item in scored if item["within_radius"]]
         spatial_candidate_count = len(in_radius)
         best_in_radius = self._pick_best(in_radius, key="combined_score")
-        best_outside = self._pick_best(
-            [item for item in scored if not item["within_radius"]],
-            key="address_score",
-        )
 
-        used_outside_radius_match = False
         if best_in_radius is not None:
             match = best_in_radius
-            score = match["combined_score"]
-            status = self._status_from_score(score)
-        elif (
-            best_outside is not None
-            and best_outside["address_score"] >= REVIEW_THRESHOLD
-        ):
-            match = best_outside
-            status, score, used_outside_radius_match = SiteResolver._resolve_outside_radius_match(
-                best_outside,
-                incoming_zip=self._normalize_zip(record.get("zip_code")),
-                search_radius_m=urbanicity.search_radius_m,
-            )
+            status, score = self._resolve_in_radius_status(match)
+            proximity_rule = self._proximity_rule_label(match, status)
         else:
-            match = best_outside
-            score = match["address_score"] if match else 0
+            match = None
+            score = 0
             status = "net_new"
+            proximity_rule = None
 
+        potential_duplicate = self.is_potential_duplicate(status=status, match=match)
         matched_record = match["record"] if match else None
         resolution_detail = self._build_resolution_detail(
             urbanicity=urbanicity,
             spatial_candidate_count=spatial_candidate_count,
+            prefilter_count=len(filtered_pool),
             match=match,
             status=status,
-            used_outside_radius_match=used_outside_radius_match,
+            proximity_rule=proximity_rule,
         )
 
         if self.verbose:
@@ -404,8 +445,10 @@ class SiteResolver:
                 int(urbanicity.search_radius_m),
             )
             logger.info(
-                "    candidates : %d total in prefetch pool, %d within radius",
+                "    candidates : %d prefetched, %d within %dm prefilter, %d within radius",
                 len(pool),
+                len(filtered_pool),
+                int(prefilter_max_m),
                 spatial_candidate_count,
             )
             if match:
@@ -427,6 +470,8 @@ class SiteResolver:
                     match["combined_score"],
                     dist,
                 )
+            if potential_duplicate:
+                logger.info("    flag       : potential_duplicate (manual calibration)")
             logger.info("    result     : %s — %s", status.upper(), resolution_detail)
 
         return {
@@ -440,8 +485,9 @@ class SiteResolver:
             "matched_record": matched_record,
             "candidate_count": len(pool),
             "spatial_candidate_count": spatial_candidate_count,
+            "prefilter_candidate_count": len(filtered_pool),
             "urbanicity": urbanicity.as_dict(),
             "resolution_detail": resolution_detail,
-            "used_outside_radius_match": used_outside_radius_match,
+            "potential_duplicate": potential_duplicate,
             "dataset_context": self._dataset_context,
         }

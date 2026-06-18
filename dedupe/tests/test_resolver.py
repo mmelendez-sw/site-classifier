@@ -39,49 +39,70 @@ def test_score_candidate_within_radius_boosts_combined_score():
     assert scored["combined_score"] >= scored["address_score"]
 
 
-def test_resolve_outside_radius_rejects_far_matches():
-    best_outside = {
-        "address_score": 70,
-        "distance_m": 8413.0,
-        "record": {"Site_Zip_Code__c": "53220"},
-    }
-    status, score, flagged = SiteResolver._resolve_outside_radius_match(
-        best_outside,
-        incoming_zip="53226",
-        search_radius_m=50,
-    )
-    assert status == "net_new"
-    assert flagged is False
-
-
-def test_resolve_outside_radius_duplicate_on_same_zip_without_coords():
-    best_outside = {
-        "address_score": 90,
-        "distance_m": None,
-        "record": {"Site_Zip_Code__c": "53215"},
-    }
-    status, score, flagged = SiteResolver._resolve_outside_radius_match(
-        best_outside,
-        incoming_zip="53215",
-        search_radius_m=50,
-    )
-    assert status == "duplicate"
-    assert flagged is True
-
-
-def test_resolve_outside_radius_rejects_different_zip_without_coords():
-    best_outside = {
-        "address_score": 66,
-        "distance_m": None,
-        "record": {"Site_Zip_Code__c": "53225"},
-    }
-    status, score, flagged = SiteResolver._resolve_outside_radius_match(
-        best_outside,
+def test_prefilter_excludes_far_candidates():
+    pool = [
+        {
+            "Id": "near",
+            "Site_Address__c": "100 Main St",
+            "Site_Latitude__c": 43.0526,
+            "Site_Longitude__c": -87.9112,
+        },
+        {
+            "Id": "far",
+            "Site_Address__c": "999 Remote Rd",
+            "Site_Latitude__c": 44.0,
+            "Site_Longitude__c": -88.5,
+        },
+    ]
+    filtered = SiteResolver._prefilter_candidates(
+        pool,
+        incoming_lat=43.052581,
+        incoming_lng=-87.911206,
         incoming_zip="53212",
-        search_radius_m=150,
+        max_distance_m=500,
     )
-    assert status == "net_new"
-    assert flagged is False
+    assert len(filtered) == 1
+    assert filtered[0]["Id"] == "near"
+
+
+def test_resolve_in_radius_status_uses_proximity_duplicate_rule():
+    match = {
+        "combined_score": 58,
+        "address_score": 78,
+        "distance_m": 12.0,
+    }
+    status, score = SiteResolver._resolve_in_radius_status(match)
+    assert status == "duplicate"
+    assert score == 58
+
+
+def test_resolve_in_radius_status_uses_proximity_review_rule():
+    match = {
+        "combined_score": 55,
+        "address_score": 72,
+        "distance_m": 40.0,
+    }
+    status, score = SiteResolver._resolve_in_radius_status(match)
+    assert status == "review"
+    assert score == 55
+
+
+def test_is_potential_duplicate_flags_close_net_new():
+    match = {
+        "within_radius": True,
+        "combined_score": 55,
+        "distance_m": 62.0,
+    }
+    assert SiteResolver.is_potential_duplicate(status="net_new", match=match) is True
+
+
+def test_is_potential_duplicate_rejects_far_net_new():
+    match = {
+        "within_radius": True,
+        "combined_score": 55,
+        "distance_m": 150.0,
+    }
+    assert SiteResolver.is_potential_duplicate(status="net_new", match=match) is False
 
 
 def test_resolve_returns_status_shape():

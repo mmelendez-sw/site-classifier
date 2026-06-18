@@ -30,57 +30,47 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 RUNS_DIR = Path("runs")
-REVIEW_LOG = RUNS_DIR / "review_log.csv"
+
+REVIEW_LOG_FIELDS = [
+    "timestamp",
+    "address",
+    "lat",
+    "lng",
+    "score",
+    "address_score",
+    "combined_score",
+    "matched_distance_m",
+    "search_radius_m",
+    "urbanicity_tier",
+    "matched_id",
+    "matched_address",
+    "resolution_detail",
+]
 
 
-def _ensure_review_log_header() -> None:
-    RUNS_DIR.mkdir(parents=True, exist_ok=True)
-    if REVIEW_LOG.exists():
+def _review_log_path(run_dir: Path) -> Path:
+    return run_dir / "review_log.csv"
+
+
+def _ensure_review_log_header(review_log: Path) -> None:
+    review_log.parent.mkdir(parents=True, exist_ok=True)
+    if review_log.exists():
         return
-    with REVIEW_LOG.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=[
-                "timestamp",
-                "address",
-                "lat",
-                "lng",
-                "score",
-                "address_score",
-                "combined_score",
-                "matched_distance_m",
-                "search_radius_m",
-                "urbanicity_tier",
-                "matched_id",
-                "matched_address",
-                "resolution_detail",
-            ],
-        )
+    with review_log.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=REVIEW_LOG_FIELDS)
         writer.writeheader()
 
 
-def _log_review(record: dict[str, Any], resolution: dict[str, Any]) -> None:
-    _ensure_review_log_header()
+def _log_review(
+    record: dict[str, Any],
+    resolution: dict[str, Any],
+    *,
+    review_log: Path,
+) -> None:
+    _ensure_review_log_header(review_log)
     matched = resolution.get("matched_record") or {}
-    with REVIEW_LOG.open("a", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=[
-                "timestamp",
-                "address",
-                "lat",
-                "lng",
-                "score",
-                "address_score",
-                "combined_score",
-                "matched_distance_m",
-                "search_radius_m",
-                "urbanicity_tier",
-                "matched_id",
-                "matched_address",
-                "resolution_detail",
-            ],
-        )
+    with review_log.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=REVIEW_LOG_FIELDS)
         writer.writerow({
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "address": record.get("address"),
@@ -191,6 +181,8 @@ def _write_dedupe_results(
         "matched_distance_m",
         "matched_coordinate_source",
         "spatial_candidate_count",
+        "prefilter_candidate_count",
+        "potential_duplicate",
         "candidate_count",
         "matched_id",
         "matched_address",
@@ -211,6 +203,7 @@ def _process_dedupe_record(
     resolver: SiteResolver,
     sf_client: SalesforceClient | None,
     *,
+    run_dir: Path,
     dry_run: bool,
     verbose: bool = False,
     index: int = 0,
@@ -248,6 +241,8 @@ def _process_dedupe_record(
         "matched_distance_m": resolution.get("matched_distance_m"),
         "matched_coordinate_source": resolution.get("matched_coordinate_source"),
         "spatial_candidate_count": resolution.get("spatial_candidate_count"),
+        "prefilter_candidate_count": resolution.get("prefilter_candidate_count"),
+        "potential_duplicate": resolution.get("potential_duplicate"),
         "candidate_count": resolution.get("candidate_count"),
         "matched_id": matched.get("Id"),
         "matched_address": matched.get(SF_ADDRESS_FIELD) or matched.get("Name"),
@@ -275,7 +270,7 @@ def _process_dedupe_record(
         return result_row, summary_delta
 
     if status == "review":
-        _log_review(canonical, resolution)
+        _log_review(canonical, resolution, review_log=_review_log_path(run_dir))
         summary_delta["review"] = 1
         logger.info(
             "Review queued: %s (combined=%s %s)",
@@ -311,7 +306,9 @@ def run_dedupe_pipeline(
     resolver = SiteResolver(verbose=verbose)
     sf_client = None if dry_run else SalesforceClient()
     run_dir = run_dir or RUNS_DIR / f"dedupe_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}"
+    run_dir.mkdir(parents=True, exist_ok=True)
     result_rows: list[dict[str, Any]] = []
+    review_log = _review_log_path(run_dir)
 
     if verbose:
         logger.info("Output directory: %s", run_dir.resolve())
@@ -350,6 +347,7 @@ def run_dedupe_pipeline(
                 canonical,
                 resolver,
                 sf_client,
+                run_dir=run_dir,
                 dry_run=dry_run,
                 verbose=verbose,
                 index=index,
@@ -365,6 +363,8 @@ def run_dedupe_pipeline(
     if result_rows:
         output = _write_dedupe_results(run_dir, result_rows)
         logger.info("Wrote dedupe results to %s", output.resolve())
+        if summary["review"]:
+            logger.info("Wrote review log to %s", review_log.resolve())
 
     if verbose:
         logger.info("")
@@ -372,7 +372,7 @@ def run_dedupe_pipeline(
         logger.info("FINAL SUMMARY")
         logger.info("  processed  : %d", summary["processed"])
         logger.info("  duplicates : %d  (skip — already in Salesforce)", summary["duplicates"])
-        logger.info("  review     : %d  (manual check — see review_log.csv)", summary["review"])
+        logger.info("  review     : %d  (manual check — see %s)", summary["review"], review_log)
         logger.info("  net_new    : %d  (OK to classify / upload next)", summary["net_new"])
         logger.info("  errors     : %d", summary["errors"])
         if dry_run:
@@ -436,6 +436,7 @@ def main(
                 canonical,
                 resolver,
                 sf_client,
+                run_dir=run_dir,
                 dry_run=dry_run,
                 verbose=verbose,
                 index=index,
@@ -467,6 +468,8 @@ def main(
     if result_rows:
         output = _write_dedupe_results(run_dir, result_rows)
         logger.info("Wrote dedupe results to %s", output)
+        if summary["review"]:
+            logger.info("Wrote review log to %s", _review_log_path(run_dir))
 
     logger.info(
         "Summary — processed=%s duplicates=%s review=%s net_new=%s loaded=%s errors=%s%s",
