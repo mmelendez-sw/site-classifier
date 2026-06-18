@@ -16,7 +16,7 @@ def test_classify_population_tiers():
 
 def test_radius_for_tier():
     assert radius_for_tier("urban") == 100
-    assert radius_for_tier("suburban") == 150
+    assert radius_for_tier("suburban") == 100
     assert radius_for_tier("rural") == 250
 
 
@@ -35,7 +35,7 @@ def test_urbanicity_for_milwaukee_zip(tmp_path, monkeypatch):
     assert profile.zip_code == "53212"
     assert profile.population == 20395
     assert profile.tier == "suburban"
-    assert profile.search_radius_m == 150
+    assert profile.search_radius_m == 100
 
 
 def test_unknown_zip_defaults_to_suburban(monkeypatch):
@@ -45,5 +45,5 @@ def test_unknown_zip_defaults_to_suburban(monkeypatch):
 
     profile = urbanicity_for_record({"address": "1 Main St, Nowhere, WI 99999", "lat": 0, "lng": 0})
     assert profile.tier == "suburban"
-    assert profile.search_radius_m == 150
+    assert profile.search_radius_m == 100
     assert profile.population is None

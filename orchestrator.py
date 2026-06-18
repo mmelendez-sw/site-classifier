@@ -45,6 +45,13 @@ REVIEW_LOG_FIELDS = [
     "urbanicity_tier",
     "matched_id",
     "matched_address",
+    "house_number_delta",
+    "suffix_mismatch",
+    "city_mismatch",
+    "runner_up_id",
+    "runner_up_score",
+    "tie_breaker_close",
+    "routing_reason",
     "proximity_rule",
     "override_reason",
     "status_source",
@@ -75,10 +82,18 @@ DEDUPE_RESULT_FIELDS = [
     "matched_city",
     "matched_state",
     "matched_zip",
+    "house_number_delta",
+    "suffix_mismatch",
+    "city_mismatch",
+    "runner_up_id",
+    "runner_up_score",
+    "tie_breaker_close",
+    "routing_reason",
     "proximity_rule",
     "override_reason",
     "status_source",
     "zip_mismatch",
+    "threshold_version",
     "resolution_detail",
 ]
 
@@ -120,6 +135,13 @@ def _log_review(
             "urbanicity_tier": (resolution.get("urbanicity") or {}).get("urbanicity_tier"),
             "matched_id": matched.get("Id"),
             "matched_address": matched.get(SF_ADDRESS_FIELD) or matched.get("Name"),
+            "house_number_delta": resolution.get("house_number_delta"),
+            "suffix_mismatch": resolution.get("suffix_mismatch"),
+            "city_mismatch": resolution.get("city_mismatch"),
+            "runner_up_id": (resolution.get("runner_up_record") or {}).get("Id"),
+            "runner_up_score": resolution.get("runner_up_score"),
+            "tie_breaker_close": resolution.get("tie_breaker_close"),
+            "routing_reason": resolution.get("routing_reason"),
             "proximity_rule": resolution.get("proximity_rule"),
             "override_reason": resolution.get("override_reason"),
             "status_source": resolution.get("status_source"),
@@ -240,6 +262,15 @@ def _format_dedupe_export_row(row: dict[str, Any]) -> dict[str, Any]:
     formatted["candidate_count"] = _format_export_number(row.get("candidate_count"), precision=0)
     formatted["potential_duplicate"] = bool(row.get("potential_duplicate"))
     formatted["zip_mismatch"] = bool(row.get("zip_mismatch"))
+    formatted["suffix_mismatch"] = bool(row.get("suffix_mismatch"))
+    formatted["city_mismatch"] = bool(row.get("city_mismatch"))
+    formatted["tie_breaker_close"] = bool(row.get("tie_breaker_close"))
+    formatted["house_number_delta"] = _format_export_number(
+        row.get("house_number_delta"), precision=0
+    )
+    formatted["runner_up_score"] = _format_export_number(
+        row.get("runner_up_score"), precision=0
+    )
     return formatted
 
 
@@ -279,6 +310,17 @@ def _write_review_log_from_rows(run_dir: Path, rows: list[dict[str, Any]]) -> No
                 "urbanicity_tier": row.get("urbanicity_tier"),
                 "matched_id": row.get("matched_id"),
                 "matched_address": row.get("matched_address"),
+                "house_number_delta": _format_export_number(
+                    row.get("house_number_delta"), precision=0
+                ),
+                "suffix_mismatch": row.get("suffix_mismatch"),
+                "city_mismatch": row.get("city_mismatch"),
+                "runner_up_id": row.get("runner_up_id"),
+                "runner_up_score": _format_export_number(
+                    row.get("runner_up_score"), precision=0
+                ),
+                "tie_breaker_close": row.get("tie_breaker_close"),
+                "routing_reason": row.get("routing_reason"),
                 "proximity_rule": row.get("proximity_rule"),
                 "override_reason": row.get("override_reason"),
                 "status_source": row.get("status_source"),
@@ -326,6 +368,7 @@ def _process_dedupe_record(
     resolution = resolver.resolve(canonical)
     status = resolution["status"]
     matched = resolution.get("matched_record") or {}
+    runner_up = resolution.get("runner_up_record") or {}
     urbanicity = resolution.get("urbanicity") or {}
 
     result_row = {
@@ -351,10 +394,18 @@ def _process_dedupe_record(
         "matched_city": matched.get(SF_CITY_FIELD),
         "matched_state": matched.get(SF_STATE_FIELD),
         "matched_zip": matched.get(SF_ZIP_FIELD),
+        "house_number_delta": resolution.get("house_number_delta"),
+        "suffix_mismatch": resolution.get("suffix_mismatch"),
+        "city_mismatch": resolution.get("city_mismatch"),
+        "runner_up_id": runner_up.get("Id"),
+        "runner_up_score": resolution.get("runner_up_score"),
+        "tie_breaker_close": resolution.get("tie_breaker_close"),
+        "routing_reason": resolution.get("routing_reason"),
         "proximity_rule": resolution.get("proximity_rule"),
         "override_reason": resolution.get("override_reason"),
         "status_source": resolution.get("status_source"),
         "zip_mismatch": resolution.get("zip_mismatch"),
+        "threshold_version": resolution.get("threshold_version"),
         "resolution_detail": resolution.get("resolution_detail"),
     }
 

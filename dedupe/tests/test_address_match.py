@@ -3,10 +3,16 @@
 from dedupe.address_match import (
     address_match_score,
     canonicalize_street_tokens,
+    collapse_osm_address,
+    evaluate_match_features,
     extract_house_number,
     extract_street_line,
+    house_number_delta,
     house_numbers_equivalent,
+    normalize_for_scoring,
+    strip_leading_poi,
     street_token_jaccard,
+    suffix_mismatch,
 )
 from ingest.address_utils import parse_zip_from_address
 
@@ -82,3 +88,84 @@ def test_parse_zip_from_verbose_address():
         "Wisconsin, 53225, United States"
     )
     assert parse_zip_from_address(address) == "53225"
+
+
+def test_strip_leading_poi_fire_station():
+    raw = (
+        "Fire Station 10, 5600, West Oklahoma Avenue, White Manor, Milwaukee, "
+        "Milwaukee County, Wisconsin, 53219, United States"
+    )
+    assert strip_leading_poi(raw).startswith("5600")
+
+
+def test_strip_leading_poi_building_name():
+    assert strip_leading_poi("Atrium Bldg,6815 W Capitol Dr") == "6815 W Capitol Dr"
+
+
+def test_collapse_osm_address_to_usps_style():
+    raw = (
+        "5825, West Fairview Avenue, Story Hill, Milwaukee, Milwaukee County, "
+        "Wisconsin, 53208, United States"
+    )
+    collapsed = collapse_osm_address(raw)
+    assert "5825" in collapsed
+    assert "MILWAUKEE" in collapsed
+    assert "53208" in collapsed
+    assert "COUNTY" not in collapsed.upper()
+
+
+def test_normalize_for_scoring_improves_fire_station_match():
+    incoming = (
+        "Fire Station 10, 5600, West Oklahoma Avenue, White Manor, Milwaukee, "
+        "Milwaukee County, Wisconsin, 53219, United States"
+    )
+    candidate = "5600 W Oklahoma Ave<br>Milwaukee, WI 53219"
+    before = address_match_score(incoming, candidate)
+    normalized_incoming = normalize_for_scoring(incoming)
+    assert "5600" in normalized_incoming
+    assert before >= 65
+
+
+def test_house_number_delta():
+    assert house_number_delta("1888 N WATER ST", "1810 North Water Street") == 78
+    assert house_number_delta("3530 W PIERCE ST", "3522 West Pierce Street") == 8
+
+
+def test_suffix_mismatch_detects_ave_vs_dr():
+    assert suffix_mismatch(
+        "5825 W FAIRVIEW AVE, MILWAUKEE, WI 53208",
+        "5825 W. Fairview Dr., Milwaukee, WI 53214",
+    )
+
+
+def test_evaluate_match_features_rejects_different_streets():
+    features = evaluate_match_features(
+        "10700 W BROWN DEER RD, MILWAUKEE, WI 53224",
+        "8847 North 107th Street, Milwaukee, WI 53224",
+        distance_m=18.5,
+    )
+    assert features["passed"] is False
+    assert features["hard_gate_reason"] == "hard_gate_street_mismatch"
+
+
+def test_evaluate_match_features_rejects_large_house_number_delta():
+    features = evaluate_match_features(
+        "1888 N WATER ST, MILWAUKEE, WI 53202",
+        "1810 North Water Street, Milwaukee, WI 53202",
+        distance_m=16.5,
+    )
+    assert features["passed"] is False
+    assert features["hard_gate_reason"] == "hard_gate_house_number_delta"
+
+
+def test_evaluate_match_features_rejects_cross_city_at_distance():
+    features = evaluate_match_features(
+        "601 S 76TH ST, MILWAUKEE, WI 53214",
+        "601 S 76Th St, WEST ALLIS, WI 53214",
+        incoming_city="MILWAUKEE",
+        matched_city="WEST ALLIS",
+        distance_m=37.2,
+    )
+    assert features["city_mismatch"] is True
+    assert features["passed"] is False
+    assert features["hard_gate_reason"] == "hard_gate_city_mismatch"

@@ -33,7 +33,8 @@ def test_mark_input_duplicates():
     assert changed == 1
     assert rows[0]["status"] == "net_new"
     assert rows[1]["status"] == "duplicate"
-    assert rows[1]["override_reason"] == "duplicate_of_input"
+    assert rows[1]["routing_reason"] == "duplicate_of_input"
+    assert rows[1]["override_reason"] is None
 
 
 def test_reconcile_shared_matched_ids():
@@ -44,7 +45,7 @@ def test_reconcile_shared_matched_ids():
     changed = reconcile_shared_matched_ids(rows)
     assert changed == 1
     assert rows[1]["status"] == "duplicate"
-    assert rows[1]["override_reason"] == "matched_id_already_claimed"
+    assert rows[1]["routing_reason"] == "matched_id_already_claimed"
 
 
 def test_promote_potential_duplicates():
@@ -52,7 +53,7 @@ def test_promote_potential_duplicates():
     changed = promote_potential_duplicates(rows)
     assert changed == 1
     assert rows[0]["status"] == "review"
-    assert rows[0]["override_reason"] == "potential_duplicate_promoted"
+    assert rows[0]["routing_reason"] == "potential_duplicate_promoted"
 
 
 def test_apply_batch_postprocess_runs_all_passes():

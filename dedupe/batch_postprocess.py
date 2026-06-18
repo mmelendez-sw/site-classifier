@@ -31,7 +31,9 @@ def mark_input_duplicates(rows: list[dict[str, Any]]) -> int:
             continue
 
         row["status"] = "duplicate"
-        row["override_reason"] = "duplicate_of_input"
+        row["routing_reason"] = "duplicate_of_input"
+        row["proximity_rule"] = "duplicate_of_input"
+        row["override_reason"] = None
         row["status_source"] = "batch_input_dedupe"
         row["potential_duplicate"] = False
         row["resolution_detail"] = (
@@ -47,7 +49,7 @@ def reconcile_shared_matched_ids(rows: list[dict[str, Any]]) -> int:
     by_matched_id: dict[str, list[int]] = {}
     for index, row in enumerate(rows):
         matched_id = row.get("matched_id")
-        if not matched_id or row.get("override_reason") == "duplicate_of_input":
+        if not matched_id or row.get("routing_reason") == "duplicate_of_input":
             continue
         by_matched_id.setdefault(str(matched_id), []).append(index)
 
@@ -70,7 +72,9 @@ def reconcile_shared_matched_ids(rows: list[dict[str, Any]]) -> int:
             if row.get("status") == "duplicate":
                 continue
             row["status"] = "duplicate"
-            row["override_reason"] = "matched_id_already_claimed"
+            row["routing_reason"] = "matched_id_already_claimed"
+            row["proximity_rule"] = "matched_id_already_claimed"
+            row["override_reason"] = None
             row["status_source"] = "batch_matched_id_reconcile"
             row["potential_duplicate"] = False
             row["resolution_detail"] = (
@@ -91,7 +95,9 @@ def promote_potential_duplicates(rows: list[dict[str, Any]]) -> int:
             row["potential_duplicate"] = False
             continue
         row["status"] = "review"
-        row["override_reason"] = "potential_duplicate_promoted"
+        row["routing_reason"] = "potential_duplicate_promoted"
+        row["proximity_rule"] = "potential_duplicate_promoted"
+        row["override_reason"] = None
         row["status_source"] = "batch_potential_duplicate"
         row["potential_duplicate"] = False
         row["resolution_detail"] = (

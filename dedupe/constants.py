@@ -2,13 +2,15 @@
 
 DUPLICATE_THRESHOLD = 85
 REVIEW_THRESHOLD = 60
+AUTO_REJECT_ADDRESS_SCORE = 50
 DEFAULT_RADIUS_METERS = 250
+THRESHOLD_VERSION = "2026-06-18"
 
 # Urbanicity tiers from ZCTA population (nationwide CSV — see ZIP_POPULATION_CSV).
 URBAN_POPULATION_MIN = 25_000
 SUBURBAN_POPULATION_MIN = 2_500
 URBAN_RADIUS_M = 100
-SUBURBAN_RADIUS_M = 150
+SUBURBAN_RADIUS_M = 100
 RURAL_RADIUS_M = 250
 URBANICITY_DEFAULT_TIER = "suburban"
 
@@ -16,10 +18,21 @@ URBANICITY_DEFAULT_TIER = "suburban"
 ADDRESS_SCORE_WEIGHT = 0.65
 PROXIMITY_SCORE_WEIGHT = 0.35
 
+# Weighted address_score components (R06).
+ADDRESS_COMPONENT_HOUSE_WEIGHT = 0.40
+ADDRESS_COMPONENT_STREET_WEIGHT = 0.40
+ADDRESS_COMPONENT_SUFFIX_WEIGHT = 0.20
+
 # Tiered high-address override (cap at 2x urbanicity prefilter radius — R4).
 HIGH_ADDRESS_EXACT_MIN = 98
 HIGH_ADDRESS_STRONG_MIN = 90
 HIGH_ADDRESS_RADIUS_MULTIPLIER = 2.0
+
+# Hard gates (R03–R05).
+STREET_NAME_JACCARD_MIN = 0.50
+HOUSE_NUMBER_DELTA_REJECT = 20
+HOUSE_NUMBER_DELTA_PENALTY_START = 10
+CITY_MISMATCH_REJECT_MIN_M = 15
 
 # Geocoder collision — very close pins but clearly different addresses.
 GEOCODER_COLLISION_MAX_M = 25
@@ -32,6 +45,15 @@ ADDRESS_FLOOR_PROXIMITY_MIN = 50
 
 # Zip mismatch at low distance — surface for review unless high-address duplicate (R8).
 ZIP_MISMATCH_REVIEW_MAX_M = 50
+
+# City mismatch with high confidence still needs review (R14).
+CITY_MISMATCH_REVIEW_MIN_COMBINED = 60
+
+# Downweight proximity when address agreement is weak (R07).
+PROXIMITY_DOWNWEIGHT_ADDRESS_MAX = 50
+
+# Runner-up tie detection (R10).
+TIE_BREAKER_CLOSE_MAX_DELTA = 5
 
 # Outside-radius fuzzy matches never promote to review/duplicate (in-radius only).
 OUTSIDE_RADIUS_REVIEW_MAX_M = 0
