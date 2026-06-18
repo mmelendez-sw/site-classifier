@@ -5,6 +5,7 @@ from dedupe.address_match import (
     canonicalize_street_tokens,
     extract_house_number,
     extract_street_line,
+    house_numbers_equivalent,
 )
 
 
@@ -24,7 +25,13 @@ def test_canonicalize_street_tokens_expands_abbreviations():
 
 def test_extract_house_number():
     assert extract_house_number("1525 North 24th Street") == "1525"
+    assert extract_house_number("727-733 North Van Buren Street") == "727-733"
     assert extract_house_number("North Avenue") is None
+
+
+def test_house_numbers_equivalent_for_range():
+    assert house_numbers_equivalent("727 N VAN BUREN ST", "727-733 N VAN BUREN ST") is True
+    assert house_numbers_equivalent("1525 N 24TH ST", "1520 N 24TH ST") is False
 
 
 def test_address_match_score_similar_streets():
@@ -35,9 +42,25 @@ def test_address_match_score_similar_streets():
     assert score >= 90
 
 
+def test_address_match_score_treats_range_as_exact():
+    score = address_match_score(
+        "727 N VAN BUREN ST, MILWAUKEE, WI 53202",
+        "727-733 North Van Buren Street<br>Milwaukee, WI 53202",
+    )
+    assert score == 100
+
+
 def test_address_match_score_penalizes_different_house_numbers():
     score = address_match_score(
         "1525 N 24TH ST, MILWAUKEE, WI 53205",
         "1520 North 24th Street, Milwaukee, WI 53205",
+    )
+    assert score <= 45
+
+
+def test_address_match_score_penalizes_geocoder_collision():
+    score = address_match_score(
+        "1888 N WATER ST, MILWAUKEE, WI 53202",
+        "1810 North Water Street, Milwaukee, WI 53202",
     )
     assert score <= 45

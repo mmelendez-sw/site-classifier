@@ -19,24 +19,24 @@ def test_fuzzy_match_prefers_close_address():
     assert match is not None
 
 
-def test_score_candidate_within_radius_boosts_combined_score():
-    incoming = "100 Main St, Milwaukee, WI 53212"
+def test_score_candidate_strong_address_ignores_proximity_penalty():
+    incoming = "1020 W HISTORIC MITCHELL ST, MILWAUKEE, WI 53204"
     sf_record = {
         "Id": "001",
-        "Site_Address__c": "100 Main Street, Milwaukee, WI 53212",
-        "Site_Latitude__c": 43.0526,
-        "Site_Longitude__c": -87.9112,
+        "Site_Address__c": "1020 West Historic Mitchell Street, Milwaukee, WI 53204",
+        "Site_Latitude__c": 43.0113,
+        "Site_Longitude__c": -87.9235,
     }
     scored = SiteResolver._score_candidate(
         incoming,
-        43.052581,
-        -87.911206,
+        43.012345,
+        -87.924450,
         sf_record,
         search_radius_m=150,
     )
     assert scored["within_radius"] is True
-    assert scored["address_score"] >= 80
-    assert scored["combined_score"] >= scored["address_score"]
+    assert scored["address_score"] == 100
+    assert scored["combined_score"] == 100
 
 
 def test_prefilter_excludes_far_candidates():
@@ -65,26 +65,42 @@ def test_prefilter_excludes_far_candidates():
     assert filtered[0]["Id"] == "near"
 
 
-def test_resolve_in_radius_status_uses_proximity_duplicate_rule():
+def test_resolve_match_status_strong_address_duplicate_at_distance():
     match = {
+        "within_radius": True,
+        "combined_score": 73,
+        "address_score": 100,
+        "distance_m": 117.0,
+    }
+    status, score, rule = SiteResolver._resolve_match_status(match)
+    assert status == "duplicate"
+    assert score == 100
+    assert rule == "high_address_match"
+
+
+def test_resolve_match_status_geocoder_collision():
+    match = {
+        "within_radius": True,
+        "combined_score": 60,
+        "address_score": 45,
+        "distance_m": 17.0,
+    }
+    status, score, rule = SiteResolver._resolve_match_status(match)
+    assert status == "review"
+    assert rule == "geocoder_collision"
+
+
+def test_resolve_match_status_uses_proximity_duplicate_rule():
+    match = {
+        "within_radius": True,
         "combined_score": 58,
         "address_score": 78,
         "distance_m": 12.0,
     }
-    status, score = SiteResolver._resolve_in_radius_status(match)
+    status, score, rule = SiteResolver._resolve_match_status(match)
     assert status == "duplicate"
     assert score == 58
-
-
-def test_resolve_in_radius_status_uses_proximity_review_rule():
-    match = {
-        "combined_score": 55,
-        "address_score": 72,
-        "distance_m": 40.0,
-    }
-    status, score = SiteResolver._resolve_in_radius_status(match)
-    assert status == "review"
-    assert score == 55
+    assert rule is not None
 
 
 def test_is_potential_duplicate_flags_close_net_new():

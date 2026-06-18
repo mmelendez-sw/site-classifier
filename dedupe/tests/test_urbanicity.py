@@ -15,7 +15,7 @@ def test_classify_population_tiers():
 
 
 def test_radius_for_tier():
-    assert radius_for_tier("urban") == 50
+    assert radius_for_tier("urban") == 100
     assert radius_for_tier("suburban") == 150
     assert radius_for_tier("rural") == 250
 
