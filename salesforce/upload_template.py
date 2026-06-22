@@ -120,7 +120,7 @@ def permit_scraping_carrier_leasing_source(when: datetime | None = None) -> str:
     moment = when or datetime.now()
     month_abbr = moment.strftime("%b").lower()
     year = moment.strftime("%Y")
-    return f"PermitScraping_{month_abbr}{year}"
+    return f"MM_PermitScraping_{month_abbr}{year}"
 
 
 def default_carrier_leasing_source(when: datetime | None = None) -> str:
@@ -131,7 +131,7 @@ def default_verified_site_source(*, from_permit: bool = True) -> str:
     configured = os.environ.get("SF_DEFAULT_VERIFIED_SOURCE", "").strip()
     if configured:
         return configured
-    return "Permitting Data" if from_permit else "Intern Verified"
+    return "Permitting Data" if from_permit else "In Person Verified"
 
 
 # def default_property_type() -> str:
