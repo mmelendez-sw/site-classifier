@@ -7,6 +7,29 @@ import re
 from dedupe.address_match import extract_city_from_address, extract_street_line_raw
 from ingest.address_utils import parse_zip_from_address
 
+_WS_RE = re.compile(r"\s+")
+_DIRECTIONALS = frozenset({"N", "S", "E", "W", "NE", "NW", "SE", "SW"})
+_STREET_SUFFIX_MAP = {
+    "ST": "St",
+    "STREET": "Street",
+    "AVE": "Ave",
+    "AV": "Av",
+    "AVENUE": "Avenue",
+    "RD": "Rd",
+    "ROAD": "Road",
+    "BLVD": "Blvd",
+    "DR": "Dr",
+    "LN": "Ln",
+    "CT": "Ct",
+    "PL": "Pl",
+    "WAY": "Way",
+    "CIR": "Cir",
+    "PKWY": "Pkwy",
+    "HWY": "Hwy",
+    "TER": "Ter",
+    "TRL": "Trl",
+}
+
 _STATE_ZIP_TAIL_RE = re.compile(
     r",\s*([^,]+),\s*([A-Z]{2})\s+(\d{5})(?:-\d{4})?\s*$",
     re.IGNORECASE,
@@ -52,9 +75,35 @@ def parse_address_components(
 
     street = extract_street_line_raw(text)
     return {
-        "site_street": street or None,
-        "site_city": city,
+        "site_street": format_address_for_upload(street) if street else None,
+        "site_city": format_address_for_upload(city) if city else None,
         "site_state": state,
         "zip_code": resolved_zip,
         "site_country": country or "US",
     }
+
+
+def format_address_for_upload(text: str | None) -> str | None:
+    """Title-case street/city for Salesforce upload while keeping USPS-style tokens."""
+    if text is None:
+        return None
+    raw = str(text).strip()
+    if not raw:
+        return None
+
+    words: list[str] = []
+    for word in raw.split():
+        if word.startswith("#"):
+            words.append(word.upper())
+            continue
+        bare = word.strip(".,;")
+        upper = bare.upper()
+        if upper in _DIRECTIONALS:
+            words.append(upper)
+        elif upper in _STREET_SUFFIX_MAP:
+            words.append(_STREET_SUFFIX_MAP[upper])
+        elif bare.isdigit() or re.match(r"^\d+[A-Z]?$", bare, re.IGNORECASE):
+            words.append(bare)
+        else:
+            words.append(bare.title())
+    return _WS_RE.sub(" ", " ".join(words))

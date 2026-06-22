@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from ingest.address_parts import parse_address_components
+from ingest.address_parts import format_address_for_upload, parse_address_components
 
 # CSV headers match the manual Data Loader template (required fields marked * in docs).
 UPLOAD_CSV_COLUMNS: list[str] = [
@@ -50,7 +50,7 @@ SITE_TYPE_VALUES: tuple[str, ...] = (
     "Monopole",
     "Mountain",
     "Rooftop",
-    "Self Support",
+    "Self Support / Lattice Tower",
     "Silo",
     "Small Cell",
     "Smokestack",
@@ -127,11 +127,11 @@ def default_carrier_leasing_source(when: datetime | None = None) -> str:
     return permit_scraping_carrier_leasing_source(when)
 
 
-def default_verified_site_source(*, from_permit: bool = True) -> str:
+def default_verified_site_source() -> str:
     configured = os.environ.get("SF_DEFAULT_VERIFIED_SOURCE", "").strip()
     if configured:
         return configured
-    return "Permitting Data" if from_permit else "In Person Verified"
+    return "Permitting Data"
 
 
 # def default_property_type() -> str:
@@ -220,9 +220,8 @@ def build_upload_record(
             zip_population=_coerce_int(dedupe_row.get("zip_population")),
         )
 
-    from_permit = bool(canonical.get("permit_metadata"))
     verified = "TRUE" if (verified_site if verified_site is not None else True) else "FALSE"
-    source = verified_site_source or default_verified_site_source(from_permit=from_permit)
+    source = verified_site_source or default_verified_site_source()
     # prop_type = property_type or default_property_type()
     carrier = carrier_leasing_source or default_carrier_leasing_source(upload_when)
 
@@ -265,6 +264,40 @@ def upload_record_to_csv_row(record: dict[str, Any]) -> dict[str, str]:
         "Verified Site Source": _csv_text(record.get("verified_site_source")),
         "Morphology": _csv_text(record.get("morphology")),
         # "Property Type": _csv_text(record.get("property_type")),
+    }
+
+
+def csv_row_to_upload_record(row: dict[str, Any]) -> dict[str, Any]:
+    """Map a Salesforce upload template CSV row back to a canonical upload dict."""
+    street = format_address_for_upload(_csv_text(row.get("Site Street"))) or ""
+    city = format_address_for_upload(_csv_text(row.get("Site City"))) or ""
+    state = _csv_text(row.get("Site State"))
+    zip_code = _csv_text(row.get("Site Zip Code"))
+    country = _csv_text(row.get("Site Country") or "US")
+    lat = row.get("Site Latitude")
+    lng = row.get("Site Longitude")
+    address = _compose_address(
+        {
+            "site_street": street,
+            "site_city": city,
+            "site_state": state,
+            "zip_code": zip_code,
+        }
+    )
+    return {
+        "site_street": street,
+        "site_city": city,
+        "site_state": state,
+        "zip_code": zip_code,
+        "site_country": country,
+        "address": address,
+        "lat": float(lat) if lat not in (None, "") else None,
+        "lng": float(lng) if lng not in (None, "") else None,
+        "carrier_leasing_source": _csv_text(row.get("Carrier Leasing Source")),
+        "site_type": _csv_text(row.get("Site Type")),
+        "verified_site": _csv_text(row.get("Verified Site") or "TRUE"),
+        "verified_site_source": _csv_text(row.get("Verified Site Source")),
+        "morphology": _csv_text(row.get("Morphology")),
     }
 
 

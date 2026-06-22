@@ -22,15 +22,15 @@ TOWER_SUBTYPE_VALUES: tuple[str, ...] = (
 TOWER_SUBTYPE_TO_SF: dict[str, str] = {
     "monopole": "Monopole",
     "guyed": "Guyed Tower",
-    "self_support": "Self Support",
+    "self_support": "Self Support / Lattice Tower",
     "stealth": "Stealth",
     "steeple": "Steeple",
     "water_tower": "Water Tower",
     "silo": "Silo",
     "flagpole": "Flagpole",
     "smokestack": "Smokestack",
-    "other_tower": "Self Support",
-    "unclear": "Self Support",
+    "other_tower": "Self Support / Lattice Tower",
+    "unclear": "Self Support / Lattice Tower",
 }
 
 SITE_TYPE_TO_SF: dict[str, str] = {
@@ -44,7 +44,7 @@ SITE_TYPE_TO_SF: dict[str, str] = {
 PERMIT_SITE_TYPE_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bmonopole\b", re.I), "Monopole"),
     (re.compile(r"\bguyed\b", re.I), "Guyed Tower"),
-    (re.compile(r"\b(self[\s-]?support|lattice)\b", re.I), "Self Support"),
+    (re.compile(r"\b(self[\s-]?support|lattice)\b", re.I), "Self Support / Lattice Tower"),
     (re.compile(r"\bstealth\b", re.I), "Stealth"),
     (re.compile(r"\bsteeple\b", re.I), "Steeple"),
     (re.compile(r"\bwater[\s-]?tower\b", re.I), "Water Tower"),

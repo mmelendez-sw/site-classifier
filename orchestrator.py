@@ -30,8 +30,9 @@ from dedupe.resolver import SiteResolver
 from dedupe.urbanicity import urbanicity_for_record
 from ingest.normalizer import normalize
 from ingest.scraper import IngestRecord
+from salesforce.field_map import OBJECT_NAME
 from salesforce.sf_client import SalesforceClient
-from salesforce.upload_template import build_upload_record, write_upload_csv
+from salesforce.upload_template import build_upload_record, upload_record_to_csv_row, write_upload_csv
 from source.record import SourceRecord
 from source.runner import list_sources, run_source
 from source.scope import parse_scope
@@ -761,20 +762,45 @@ def main(
         logger.info("Wrote dedupe results to %s", output)
 
         if sf_client and not dry_run:
-            for index, row in enumerate(result_rows):
-                if row.get("status") != "net_new":
-                    continue
-                classified = classified_by_index.get(index)
-                if classified is None:
-                    continue
+            upload_targets = [
+                (index, row)
+                for index, row in enumerate(result_rows)
+                if row.get("status") == "net_new" and classified_by_index.get(index) is not None
+            ]
+            upload_total = len(upload_targets)
+            if verbose and upload_total:
+                logger.info("=" * 72)
+                logger.info("SALESFORCE UPLOAD (%d net-new sites)", upload_total)
+                logger.info("  object: %s", OBJECT_NAME)
+                logger.info("=" * 72)
+            for upload_index, (index, row) in enumerate(upload_targets, start=1):
+                classified = classified_by_index[index]
+                canonical = canonical_records[index]
                 upload_record = build_upload_record(
-                    canonical_records[index],
+                    canonical,
                     classified=classified,
                     dedupe_row=row,
                 )
-                sf_client.create_site(upload_record)
+                csv_row = upload_record_to_csv_row(upload_record)
+                if verbose:
+                    logger.info(
+                        "[%d/%d] Creating Site__c — %s",
+                        upload_index,
+                        upload_total,
+                        canonical["address"],
+                    )
+                    logger.info(
+                        "         type=%s morphology=%s carrier=%s",
+                        csv_row.get("Site Type") or "—",
+                        csv_row.get("Morphology") or "—",
+                        csv_row.get("Carrier Leasing Source") or "—",
+                    )
+                sf_client.create_site(upload_record, verbose=verbose)
                 summary["loaded"] += 1
-                logger.info("Loaded net-new site: %s", canonical_records[index]["address"])
+                logger.info("Loaded net-new site: %s", canonical["address"])
+            if verbose and upload_total:
+                logger.info("Salesforce upload complete — loaded=%d", summary["loaded"])
+                logger.info("=" * 72)
         elif dry_run and summary["net_new"]:
             logger.info(
                 "Dry-run: %s net-new rows exported to sf_upload.csv (no Salesforce writes)",
@@ -841,7 +867,7 @@ def _parse_args() -> argparse.Namespace:
         "--verbose",
         "-v",
         action="store_true",
-        help="Print detailed step-by-step progress (on by default with --dry-run)",
+        help="Print detailed step-by-step progress (on by default with --dry-run or --classify)",
     )
     parser.add_argument("--country", help="Country scope (e.g. US)")
     parser.add_argument("--state", help="State scope (e.g. WI)")
@@ -864,7 +890,7 @@ def _parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     args = _parse_args()
-    verbose = args.verbose or args.dry_run
+    verbose = args.verbose or args.dry_run or args.classify
     scope = parse_scope(
         country=args.country,
         state=args.state,
